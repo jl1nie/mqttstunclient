@@ -1,0 +1,13 @@
+[package]
+name = "mqttstunclient"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+local-ip-address = "0.6.5"
+stunclient = "0.4.1"
+chacha20poly1305 = "0.10"  # ChaCha20暗号化
+rumqttc = "0.24"           # MQTTクライアント
+rand = "0.9"               # ランダム数生成
+log = { version = "0.4", default-features = false }
+
