@@ -3,11 +3,33 @@ name = "mqttstunclient"
 version = "0.1.0"
 edition = "2024"
 
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+debug = true    # Symbols are nice and they don't increase the size on Flash
+opt-level = "z"
+
+
+[features]
+default = ["rumqttc"]
+#default = ["esp-idf-mqtt", "native"]
+native = ["esp-idf-sys/native"]
+esp-idf-mqtt = ["esp-idf-svc", "esp-idf-hal", "esp-idf-sys"]
+
 [dependencies]
 local-ip-address = "0.6.5"
 stunclient = "0.4.1"
-chacha20poly1305 = "0.10"  # ChaCha20暗号化
-rumqttc = "0.24"           # MQTTクライアント
-rand = "0.9"               # ランダム数生成
+chacha20poly1305 = "0.10"                           # ChaCha20暗号化
+rumqttc = { version = "0.24", optional = true }
+rand = "0.9"                                        # ランダム数生成
 log = { version = "0.4", default-features = false }
 
+esp-idf-sys = { version = "0.36", features = ["binstart"], optional = true }
+esp-idf-svc = { version = "0.51", features = ["experimental"], optional = true }
+esp-idf-hal = { version = "0.45.2", optional = true }
+
+[build-dependencies]
+embuild = "0.33"
+anyhow = "1"
+cc = "1.1.31"
