@@ -1,7 +1,6 @@
 use chacha20poly1305::ChaCha20Poly1305;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use log::trace;
-use rumqttc::{Client, Event, MqttOptions, Packet, QoS};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use stunclient::StunClient;
 
@@ -54,13 +53,12 @@ impl MQTTStunClient {
         let stun_server = "stun.l.google.com:19302"
             .to_socket_addrs()
             .unwrap()
-            .filter(|x| x.is_ipv4())
-            .next()
+            .find(|x| x.is_ipv4())
             .unwrap();
 
         let client = StunClient::new(stun_server);
 
-        if let Ok(stun_addr) = client.query_external_address(&socket) {
+        if let Ok(stun_addr) = client.query_external_address(socket) {
             self.stun_addr = Some(stun_addr);
             return Some(stun_addr);
         }
@@ -80,7 +78,10 @@ impl MQTTStunClient {
         self.encrypt_message(message.as_bytes())
     }
 
+    #[cfg(feature = "rumqttc")]
     pub fn get_server_addr(&mut self, socket: &UdpSocket) -> Option<SocketAddr> {
+        use rumqttc::{Client, Event, MqttOptions, Packet, QoS};
+
         let mqttoptions = MqttOptions::new("wifikey-client", "broker.emqx.io", 1883);
         let (client, mut connection) = Client::new(mqttoptions, 10);
 
@@ -125,8 +126,9 @@ impl MQTTStunClient {
             }
         }
     }
-
+    #[cfg(feature = "rumqttc")]
     pub fn get_client_addr(&mut self, socket: &UdpSocket) -> Option<SocketAddr> {
+        use rumqttc::{Client, Event, MqttOptions, Packet, QoS};
         let mqttoptions = MqttOptions::new("wifikey-server", "broker.emqx.io", 1883);
         let (client, mut connection) = Client::new(mqttoptions, 10);
 
@@ -169,6 +171,188 @@ impl MQTTStunClient {
                 }
             } else {
                 trace!("Error: {:?}", notification);
+            }
+        }
+    }
+
+    #[cfg(feature = "esp-idf-mqtt")]
+    pub fn get_server_addr(&mut self, socket: &UdpSocket) -> Option<SocketAddr> {
+        use esp_idf_svc::mqtt::client::{EspMqttClient, MqttClientConfiguration, QoS};
+
+        let broker_url = "mqtt://broker.emqx.io:1883";
+        let mqtt_config = MqttClientConfiguration::default();
+        // mqtt_config.client_id = Some("wifikey-client"); // 必要に応じてクライアントIDを設定
+
+        let (mut client, mut connection) = match EspMqttClient::new(broker_url, &mqtt_config) {
+            Ok(c) => c,
+            Err(e) => {
+                trace!("Failed to create MQTT client: {:?}", e);
+                return None;
+            }
+        };
+
+        let client_addr = self.get_global_ip(socket);
+        let ctopic = format!("{}{}", self.mqtt_topic, "/client");
+        match client.publish(&ctopic, QoS::AtLeastOnce, true, &client_addr) {
+            Ok(_) => trace!("Published client address to {}", ctopic),
+            Err(e) => {
+                trace!("Failed to publish client address: {:?}", e);
+                return None;
+            }
+        }
+
+        let topic = format!("{}{}", self.mqtt_topic, "/server");
+        match client.subscribe(&topic, QoS::AtLeastOnce) {
+            Ok(_) => trace!("Subscribed to {}", topic),
+            Err(e) => {
+                trace!("Failed to subscribe to topic: {:?}", e);
+                return None;
+            }
+        }
+
+        loop {
+            match connection.next() {
+                Ok(event) => {
+                    match event.payload() {
+                        esp_idf_svc::mqtt::client::EventPayload::Received {
+                            id: _,
+                            topic: Some(recv_topic),
+                            data,
+                            details: _,
+                        } if recv_topic == topic => {
+                            if let Some(peer_addr_str) = self.decrypt_message(data) {
+                                match peer_addr_str.parse::<SocketAddr>() {
+                                    Ok(peer_socket_addr) => {
+                                        trace!("Server Address: {}", peer_socket_addr);
+                                        for _ in 0..5 {
+                                            socket.send_to(b"PU", peer_socket_addr).unwrap();
+                                            std::thread::sleep(std::time::Duration::from_millis(
+                                                100,
+                                            ));
+                                        }
+                                        match client.publish(&ctopic, QoS::AtLeastOnce, true, &[]) {
+                                            // 空メッセージで上書き！
+                                            Ok(_) => {
+                                                trace!("Published empty message to {}", ctopic)
+                                            }
+                                            Err(e) => {
+                                                trace!("Failed to publish empty message: {:?}", e)
+                                            }
+                                        }
+                                        self.peer_addr = Some(peer_socket_addr);
+                                        return self.peer_addr;
+                                    }
+                                    Err(e) => {
+                                        trace!(
+                                            "Failed to parse peer address '{}': {}",
+                                            peer_addr_str, e
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        _ => trace!("Received other MQTT event: {:?}", event.payload()),
+                    }
+                }
+                Err(e) => {
+                    trace!("MQTT Error: {:?}", e);
+                    return None;
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "esp-idf-mqtt")]
+    pub fn get_client_addr(&mut self, socket: &UdpSocket) -> Option<SocketAddr> {
+        use esp_idf_svc::mqtt::client::{EspMqttClient, MqttClientConfiguration, QoS}; // QoS をインポート
+
+        let broker_url = "mqtt://broker.emqx.io:1883";
+        let mqtt_config = MqttClientConfiguration {
+            client_id: Some("wifikey-server"),
+            ..Default::default()
+        };
+
+        let (mut client, mut connection) = match EspMqttClient::new(broker_url, &mqtt_config) {
+            Ok(c) => c,
+            Err(e) => {
+                trace!("Failed to create MQTT client: {:?}", e);
+                return None;
+            }
+        };
+
+        let server_addr = self.get_global_ip(socket);
+        let server_topic = format!("{}{}", self.mqtt_topic, "/server");
+        match client.publish(&server_topic, QoS::AtLeastOnce, true, &server_addr) {
+            Ok(_) => trace!("Published server address to {}", server_topic),
+            Err(e) => {
+                trace!("Failed to publish server address: {:?}", e);
+                return None;
+            }
+        }
+
+        let client_topic = format!("{}{}", self.mqtt_topic, "/client");
+        // クライアントトピックを空メッセージで上書き
+        match client.publish(&client_topic, QoS::AtLeastOnce, true, &[]) {
+            Ok(_) => trace!("Published empty message to {}", client_topic),
+            Err(e) => {
+                trace!("Failed to publish empty message to client topic: {:?}", e);
+                // ここでリターンするかどうかは要件次第だけど、とりあえずログだけ出す
+            }
+        }
+
+        match client.subscribe(&client_topic, QoS::AtLeastOnce) {
+            Ok(_) => trace!("Subscribed to {}", client_topic),
+            Err(e) => {
+                trace!("Failed to subscribe to topic: {:?}", e);
+                return None;
+            }
+        }
+
+        loop {
+            match connection.next() {
+                Ok(event) => {
+                    match event.payload() {
+                        esp_idf_svc::mqtt::client::EventPayload::Received {
+                            id: _,
+                            topic: Some(recv_topic),
+                            data,
+                            details: _,
+                        } if recv_topic == client_topic => {
+                            if data.is_empty() {
+                                // 空のメッセージは無視する（自分のpublishかもしれないし）
+                                trace!("Received empty message on client topic, skipping.");
+                                continue;
+                            }
+                            if let Some(peer_addr_str) = self.decrypt_message(data) {
+                                match peer_addr_str.parse::<SocketAddr>() {
+                                    Ok(peer_socket_addr) => {
+                                        trace!("Client Address: {}", peer_socket_addr);
+                                        for _ in 0..5 {
+                                            socket.send_to(b"PU", peer_socket_addr).unwrap();
+                                            std::thread::sleep(std::time::Duration::from_millis(
+                                                100,
+                                            ));
+                                        }
+                                        self.peer_addr = Some(peer_socket_addr);
+                                        return self.peer_addr;
+                                    }
+                                    Err(e) => {
+                                        trace!(
+                                            "Failed to parse peer address '{}': {}",
+                                            peer_addr_str, e
+                                        );
+                                        // パース失敗時はループを継続
+                                    }
+                                }
+                            }
+                        }
+                        _ => trace!("Received other MQTT event: {:?}", event.payload()),
+                    }
+                }
+                Err(e) => {
+                    trace!("MQTT Error: {:?}", e);
+                    return None;
+                }
             }
         }
     }
