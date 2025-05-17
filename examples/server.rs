@@ -1,9 +1,10 @@
 use mqttstunclient::MQTTStunClient;
 use std::net::UdpSocket;
-
 fn main() {
-    let mqtt_topic = "jl1nie/wifikey".to_string();
-    let mut server = MQTTStunClient::new(mqtt_topic, "wifykeypassphrase");
+    env_logger::init();
+
+    let server_name = "jl1nie/wifikey".to_string();
+    let mut server = MQTTStunClient::new(server_name, "wifykeypassphrase", None, None);
 
     let udp = UdpSocket::bind("0.0.0.0:0").unwrap();
     if let Some(client_addr) = server.get_client_addr(&udp) {
