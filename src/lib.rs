@@ -33,9 +33,8 @@ impl MQTTStunClient {
             .unwrap_or("stun.l.google.com:19302")
             .to_socket_addrs()
             .ok()
-            .unwrap()
-            .next()
-            .unwrap();
+            .and_then(|iter| iter.filter(|addr| addr.is_ipv4()).next()) // IPv4アドレスだけフィルタリング！
+            .expect("STUN server IPv4 address not found."); // 見つからなかったらパニック！
 
         let mqtt_broker_url = mqtt_broker_url
             .unwrap_or("mqtt://broker.emqx.io:1883")
@@ -52,6 +51,27 @@ impl MQTTStunClient {
             stun_server_addr,
             mqtt_broker_url,
         }
+    }
+
+    pub fn sanity_check(&self) {
+        // ここで sanity check を行う
+        if self.key.len() != 32 {
+            panic!("Key length must be 32 bytes");
+        }
+        if self.server_name.is_empty() {
+            panic!("Server name cannot be empty");
+        }
+        let check_message = "Sanity check passed!";
+        let encrypted_message = self.encrypt_message(check_message.as_bytes());
+        let decrypted_message = self.decrypt_message(&encrypted_message);
+        if decrypted_message.is_none() {
+            panic!("Decryption failed after encryption");
+        }
+        let decrypted_message = decrypted_message.unwrap();
+        if decrypted_message != check_message {
+            panic!("Decrypted message does not match original");
+        }
+        info!("Sanity check passed!");
     }
 
     fn encrypt_message(&self, plaintext: &[u8]) -> Vec<u8> {
@@ -483,263 +503,459 @@ impl MQTTStunClient {
 
     #[cfg(feature = "esp-idf-mqtt")]
     pub fn get_server_addr(&mut self, socket: &UdpSocket) -> Option<SocketAddr> {
-        use esp_idf_svc::mqtt::client::{EspMqttClient, MqttClientConfiguration, QoS};
+        use esp_idf_svc::mqtt::client::{EspMqttClient, Event, MqttClientConfiguration, QoS}; // Event を使う！
+        use std::sync::mpsc;
+        use std::thread;
+
+        let client_addr_payload = self.get_global_ip(socket);
+        let ctopic_base = format!("{}{}", self.server_name, "/client");
+        let topic_to_subscribe_base = format!("{}{}", self.server_name, "/server");
 
         let broker_url = self.mqtt_broker_url.as_str();
         let mqtt_config = MqttClientConfiguration::default();
-        // mqtt_config.client_id = Some("wifikey-client"); // 必要に応じてクライアントIDを設定
 
         let (mut client, mut connection) = match EspMqttClient::new(broker_url, &mqtt_config) {
             Ok(c) => c,
             Err(e) => {
-                info!("Failed to create MQTT client: {:?}", e);
+                info!("メインスレッドでMQTTクライアント作成失敗: {:?}", e);
                 return None;
             }
         };
+        info!("メインスレッドでMQTTクライアント作成成功！");
 
-        let client_addr = self.get_global_ip(socket);
-        let ctopic = format!("{}{}", self.server_name, "/client");
-        match client.publish(&ctopic, QoS::AtLeastOnce, true, &client_addr) {
-            Ok(_) => info!("Published client address to {}", ctopic),
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let topic_to_subscribe_for_thread = topic_to_subscribe_base.clone();
+        let ctopic_for_empty_publish = ctopic_base.clone();
+
+        thread::spawn(move || {
+            info!("MQTTイベントループスレッド開始！");
+            // connection は Iterator<Item = Result<Event<'a, Message>>> を実装してるはずだから、
+            // for event_result in connection.iter() って書ける！
+            loop {
+                let event_result = connection.next();
+                // iter() を使ってループ！
+                info!("MQTTイベントループスレッドでイベント待ち中…");
+                match event_result {
+                    Ok(event) => {
+                        // Result を剥がす！
+                        match event.payload() {
+                            esp_idf_svc::mqtt::client::EventPayload::Received {
+                                id: _,
+                                topic: Some(recv_topic),
+                                data,
+                                details: _,
+                            } if recv_topic == topic_to_subscribe_for_thread => {
+                                info!("暗号化されたデータ受信！ ({} bytes)", data.len());
+                                if let Err(e) = tx.send(data.to_vec()) {
+                                    info!("チャネルに暗号化データ送るの失敗した… {}", e);
+                                    return; // 送信失敗ならスレッド終了
+                                }
+                                info!("暗号化データ送信完了、スレッドの役目は一旦終わり！");
+                            }
+                            esp_idf_svc::mqtt::client::EventPayload::Connected(_) => {
+                                info!("MQTT Connected in thread!");
+                            }
+                            esp_idf_svc::mqtt::client::EventPayload::Disconnected => {
+                                info!("MQTT Disconnected in thread, exiting loop.");
+                                return; // 切断されたらスレッド終了
+                            }
+                            // 他のイベントも必要ならここで処理してね！
+                            _ => {
+                                info!("Received other MQTT event: {:?}", event.payload())
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        info!("MQTT Error in thread's event loop: {:?}", e);
+                        return; // エラーならスレッド終了
+                    }
+                }
+                info!("MQTT event loop finished in thread."); // iter() が終わったらここに来る (普通は来ないはずだけど)
+            }
+        });
+
+        info!("メインスレッド: publish開始！");
+        match client.publish(&ctopic_base, QoS::AtLeastOnce, true, &client_addr_payload) {
+            Ok(_) => info!("Published client address to {}", ctopic_base),
             Err(e) => {
                 info!("Failed to publish client address: {:?}", e);
                 return None;
             }
         }
+        info!("メインスレッド: publish完了！ subscribe開始！");
 
-        let topic = format!("{}{}", self.server_name, "/server");
-        match client.subscribe(&topic, QoS::AtLeastOnce) {
-            Ok(_) => info!("Subscribed to {}", topic),
+        match client.subscribe(&topic_to_subscribe_base, QoS::AtLeastOnce) {
+            Ok(_) => info!("Subscribed to {}", topic_to_subscribe_base),
             Err(e) => {
                 info!("Failed to subscribe to topic: {:?}", e);
                 return None;
             }
         }
+        info!("メインスレッド: subscribe完了！ チャネルからの受信待ち…");
 
-        loop {
-            match connection.next() {
-                Ok(event) => {
-                    match event.payload() {
-                        esp_idf_svc::mqtt::client::EventPayload::Received {
-                            id: _,
-                            topic: Some(recv_topic),
-                            data,
-                            details: _,
-                        } if recv_topic == topic => {
-                            if let Some(peer_addr_str) = self.decrypt_message(data) {
-                                match peer_addr_str.parse::<SocketAddr>() {
-                                    Ok(peer_socket_addr) => {
-                                        info!("Server Address: {}", peer_socket_addr);
-                                        for _ in 0..5 {
-                                            socket.send_to(b"PU", peer_socket_addr).unwrap();
-                                            std::thread::sleep(std::time::Duration::from_millis(
-                                                100,
-                                            ));
-                                        }
-                                        // パンチングパケットの受信と破棄
-                                        socket
-                                            .set_read_timeout(Some(
-                                                std::time::Duration::from_millis(200),
-                                            ))
-                                            .unwrap();
-                                        let mut buf = [0; 5]; // 受信バッファ
-                                        for _ in 0..10 {
-                                            // 念のため複数回試行
-                                            match socket.recv_from(&mut buf) {
-                                                Ok((amt, src)) => {
-                                                    if &buf[..amt] == b"PU" {
-                                                        info!(
-                                                            "Received punching packet from {}",
-                                                            src
-                                                        );
-                                                    } else {
-                                                        info!(
-                                                            "Received unexpected packet from {}: {:?}",
-                                                            src,
-                                                            &buf[..amt]
-                                                        );
-                                                    }
-                                                }
-                                                Err(ref e)
-                                                    if e.kind()
-                                                        == std::io::ErrorKind::WouldBlock
-                                                        || e.kind()
-                                                            == std::io::ErrorKind::TimedOut =>
-                                                {
-                                                    break;
-                                                }
-                                                Err(e) => {
-                                                    info!(
-                                                        "Error receiving punching packet: {:?}",
-                                                        e
-                                                    );
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        match client.publish(&ctopic, QoS::AtLeastOnce, true, &[]) {
-                                            // 空メッセージで上書き！
-                                            Ok(_) => {
-                                                info!("Published empty message to {}", ctopic)
-                                            }
-                                            Err(e) => {
-                                                info!("Failed to publish empty message: {:?}", e)
-                                            }
-                                        }
-                                        return Some(peer_socket_addr);
-                                    }
-                                    Err(e) => {
-                                        info!(
-                                            "Failed to parse peer address '{}': {}",
-                                            peer_addr_str, e
-                                        );
-                                    }
+        let peer_addr_option = match rx.recv_timeout(std::time::Duration::from_secs(300)) {
+            Ok(encrypted_data) => {
+                info!(
+                    "メインスレッドで暗号化データゲットだぜ！ ({} bytes)",
+                    encrypted_data.len()
+                );
+                if let Some(peer_addr_str) = self.decrypt_message(&encrypted_data) {
+                    match peer_addr_str.parse::<SocketAddr>() {
+                        Ok(peer_addr) => {
+                            info!("ピアアドレスの復号＆パース成功！ {}", peer_addr);
+                            match client.publish(
+                                &ctopic_for_empty_publish,
+                                QoS::AtLeastOnce,
+                                true,
+                                &[],
+                            ) {
+                                Ok(_) => {
+                                    info!("Published empty message to {}", ctopic_for_empty_publish)
                                 }
+                                Err(e) => info!("Failed to publish empty message: {:?}", e),
                             }
+                            Some(peer_addr)
                         }
-                        _ => info!("Received other MQTT event: {:?}", event.payload()),
+                        Err(e) => {
+                            info!("ピアアドレスのパース失敗 '{}': {}", peer_addr_str, e);
+                            None
+                        }
                     }
-                }
-                Err(e) => {
-                    info!("MQTT Error: {:?}", e);
-                    return None;
+                } else {
+                    info!("メッセージの復号失敗…");
+                    None
                 }
             }
+            Err(e) => {
+                info!(
+                    "チャネルから暗号化データ受け取るの失敗した… (タイムアウトかも？) {}",
+                    e
+                );
+                None
+            }
+        };
+
+        // 必要ならここで unsubscribe とか client の終了処理を入れる
+        // client.unsubscribe(&topic_to_subscribe_base).unwrap_or_else(|e| info!("unsubscribe失敗: {:?}", e));
+        // drop(client); // client を明示的にドロップして接続を閉じる (必要なら)
+        // TODO: スレッドを安全に停止させる方法も考えた方がいいかも (例: AtomicBool でフラグ立てるとか)
+
+        if let Some(peer_addr) = peer_addr_option {
+            for _ in 0..5 {
+                if let Err(e) = socket.send_to(b"PU", peer_addr) {
+                    info!("パンチングパケット送るの失敗… {}", e);
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+                .unwrap_or_else(|e| info!("パンチング受信のタイムアウト設定失敗: {}", e));
+            let mut buf = [0; 10];
+            let mut punching_success = false;
+            for i in 0..8 {
+                match socket.recv_from(&mut buf) {
+                    Ok((amt, src)) => {
+                        if &buf[..amt] == b"PU" {
+                            info!("パンチングパケット受信した！ from {}", src);
+                            punching_success = true;
+                            // 1個受信成功したら、残りのループはゴミ掃除モードに移行するためにタイムアウトを短くする！
+                            socket
+                                .set_read_timeout(Some(std::time::Duration::from_millis(50)))
+                                .unwrap_or_else(|e| info!("ゴミ掃除用タイムアウト設定失敗: {}", e));
+                        } else {
+                            info!("なんか違うパケット来た from {}: {:?}", src, &buf[..amt]);
+                        }
+                    }
+                    Err(ref e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        if punching_success {
+                            info!(
+                                "タイムアウトしたけどパンチング成功済み！({}) ゴミ掃除完了！",
+                                i + 1
+                            );
+                        } else {
+                            info!(
+                                "タイムアウト…パンチングパケット来なかったっぽい…({})",
+                                i + 1
+                            );
+                        }
+                        break; // タイムアウトならループ終了
+                    }
+                    Err(e) => {
+                        info!("パンチングパケット受信エラー: {:?}", e);
+                        break;
+                    }
+                }
+            }
+            if punching_success {
+                info!("パンチング処理完了！ソケットはキレイになったはず！✨");
+                return Some(peer_addr);
+            } else {
+                info!("パンチング失敗…😢");
+                return None;
+            }
         }
+        None
     }
 
     #[cfg(feature = "esp-idf-mqtt")]
     pub fn get_client_addr(&mut self, socket: &UdpSocket) -> Option<SocketAddr> {
-        use esp_idf_svc::mqtt::client::{EspMqttClient, MqttClientConfiguration, QoS}; // QoS をインポート
+        use esp_idf_svc::mqtt::client::{EspMqttClient, Event, MqttClientConfiguration, QoS}; // Event を使う！
+        use std::sync::mpsc;
+        use std::thread;
+
+        let server_addr_payload = self.get_global_ip(socket);
+        let server_topic_base = format!("{}{}", self.server_name, "/server");
+        let client_topic_to_subscribe_base = format!("{}{}", self.server_name, "/client");
 
         let broker_url = self.mqtt_broker_url.as_str();
         let mqtt_config = MqttClientConfiguration {
-            client_id: Some("wifikey-server"),
+            client_id: Some("wifikey-server"), // client_id は get_server_addr と被らないようにね！
             ..Default::default()
         };
 
         let (mut client, mut connection) = match EspMqttClient::new(broker_url, &mqtt_config) {
             Ok(c) => c,
             Err(e) => {
-                info!("Failed to create MQTT client: {:?}", e);
+                info!(
+                    "メインスレッドでMQTTクライアント作成失敗 (get_client_addr): {:?}",
+                    e
+                );
                 return None;
             }
         };
+        info!("メインスレッドでMQTTクライアント作成成功！ (get_client_addr)");
 
-        let server_addr = self.get_global_ip(socket);
-        let server_topic = format!("{}{}", self.server_name, "/server");
-        match client.publish(&server_topic, QoS::AtLeastOnce, true, &server_addr) {
-            Ok(_) => info!("Published server address to {}", server_topic),
-            Err(e) => {
-                info!("Failed to publish server address: {:?}", e);
-                return None;
-            }
-        }
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let client_topic_to_subscribe_for_thread = client_topic_to_subscribe_base.clone();
 
-        let client_topic = format!("{}{}", self.server_name, "/client");
-        // クライアントトピックを空メッセージで上書き
-        match client.publish(&client_topic, QoS::AtLeastOnce, true, &[]) {
-            Ok(_) => info!("Published empty message to {}", client_topic),
-            Err(e) => {
-                info!("Failed to publish empty message to client topic: {:?}", e);
-                // ここでリターンするかどうかは要件次第だけど、とりあえずログだけ出す
-            }
-        }
-
-        match client.subscribe(&client_topic, QoS::AtLeastOnce) {
-            Ok(_) => info!("Subscribed to {}", client_topic),
-            Err(e) => {
-                info!("Failed to subscribe to topic: {:?}", e);
-                return None;
-            }
-        }
-
-        loop {
-            match connection.next() {
-                Ok(event) => {
-                    match event.payload() {
-                        esp_idf_svc::mqtt::client::EventPayload::Received {
-                            id: _,
-                            topic: Some(recv_topic),
-                            data,
-                            details: _,
-                        } if recv_topic == client_topic => {
-                            if data.is_empty() {
-                                // 空のメッセージは無視する（自分のpublishかもしれないし）
-                                info!("Received empty message on client topic, skipping.");
-                                continue;
-                            }
-                            if let Some(peer_addr_str) = self.decrypt_message(data) {
-                                match peer_addr_str.parse::<SocketAddr>() {
-                                    Ok(peer_socket_addr) => {
-                                        info!("Client Address: {}", peer_socket_addr);
-                                        for _ in 0..5 {
-                                            socket.send_to(b"PU", peer_socket_addr).unwrap();
-                                            std::thread::sleep(std::time::Duration::from_millis(
-                                                100,
-                                            ));
-                                        }
-                                        // パンチングパケットの受信と破棄
-                                        socket
-                                            .set_read_timeout(Some(
-                                                std::time::Duration::from_millis(200),
-                                            ))
-                                            .unwrap();
-                                        let mut buf = [0; 10]; // 受信バッファ
-                                        for _ in 0..5 {
-                                            // 念のため複数回試行
-                                            match socket.recv_from(&mut buf) {
-                                                Ok((amt, src)) => {
-                                                    if &buf[..amt] == b"PU" {
-                                                        info!(
-                                                            "Received punching packet from {}",
-                                                            src
-                                                        );
-                                                    } else {
-                                                        info!(
-                                                            "Received unexpected packet from {}: {:?}",
-                                                            src,
-                                                            &buf[..amt]
-                                                        );
-                                                    }
-                                                }
-                                                Err(ref e)
-                                                    if e.kind()
-                                                        == std::io::ErrorKind::WouldBlock
-                                                        || e.kind()
-                                                            == std::io::ErrorKind::TimedOut =>
-                                                {
-                                                    break;
-                                                }
-                                                Err(e) => {
-                                                    info!(
-                                                        "Error receiving punching packet: {:?}",
-                                                        e
-                                                    );
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        return Some(peer_socket_addr);
-                                    }
-                                    Err(e) => {
-                                        info!(
-                                            "Failed to parse peer address '{}': {}",
-                                            peer_addr_str, e
-                                        );
-                                        // パース失敗時はループを継続
-                                    }
+        thread::spawn(move || {
+            info!("MQTTイベントループスレッド開始！ (get_client_addr)");
+            loop {
+                let event_result = connection.next();
+                // iter() を使ってループ！
+                match event_result {
+                    Ok(event) => {
+                        // Result を剥がす！
+                        match event.payload() {
+                            esp_idf_svc::mqtt::client::EventPayload::Received {
+                                id: _,
+                                topic: Some(recv_topic),
+                                data,
+                                details: _,
+                            } if recv_topic == client_topic_to_subscribe_for_thread => {
+                                if data.is_empty() {
+                                    info!("空メッセージ受信 (get_client_addr), スキップするね！");
+                                    continue;
                                 }
+                                info!(
+                                    "暗号化されたデータ受信！ ({} bytes) (get_client_addr)",
+                                    data.len()
+                                );
+                                if let Err(e) = tx.send(data.to_vec()) {
+                                    info!(
+                                        "チャネルに暗号化データ送るの失敗した… {}(get_client_addr)",
+                                        e
+                                    );
+                                    return;
+                                }
+                                info!(
+                                    "暗号化データ送信完了、スレッドの役目は一旦終わり！ (get_client_addr)"
+                                );
+                            }
+                            esp_idf_svc::mqtt::client::EventPayload::Connected(_) => {
+                                info!("MQTT Connected in thread! (get_client_addr)");
+                            }
+                            esp_idf_svc::mqtt::client::EventPayload::Disconnected => {
+                                info!(
+                                    "MQTT Disconnected in thread, exiting loop. (get_client_addr)"
+                                );
+                                return;
+                            }
+                            _ => { /* info!("Received other MQTT event: {:?} (get_client_addr)", event.payload()) */
                             }
                         }
-                        _ => info!("Received other MQTT event: {:?}", event.payload()),
+                    }
+                    Err(e) => {
+                        info!(
+                            "MQTT Error in thread's event loop: {:?} (get_client_addr)",
+                            e
+                        );
+                        return;
                     }
                 }
-                Err(e) => {
-                    info!("MQTT Error: {:?}", e);
-                    return None;
-                }
+            }
+            info!("MQTT event loop finished in thread. (get_client_addr)");
+        });
+
+        info!("メインスレッド: publish開始！ (get_client_addr)");
+        match client.publish(
+            &server_topic_base,
+            QoS::AtLeastOnce,
+            true,
+            &server_addr_payload,
+        ) {
+            Ok(_) => info!(
+                "Published server address to {} (get_client_addr)",
+                server_topic_base
+            ),
+            Err(e) => {
+                info!(
+                    "Failed to publish server address: {:?} (get_client_addr)",
+                    e
+                );
+                return None;
             }
         }
+
+        match client.publish(&client_topic_to_subscribe_base, QoS::AtLeastOnce, true, &[]) {
+            Ok(_) => info!(
+                "Published empty message to {} (get_client_addr)",
+                client_topic_to_subscribe_base
+            ),
+            Err(e) => {
+                info!(
+                    "Failed to publish empty message to client topic: {:?} (get_client_addr)",
+                    e
+                );
+            }
+        }
+        info!("メインスレッド: publish完了！ subscribe開始！ (get_client_addr)");
+
+        match client.subscribe(&client_topic_to_subscribe_base, QoS::AtLeastOnce) {
+            Ok(_) => info!(
+                "Subscribed to {} (get_client_addr)",
+                client_topic_to_subscribe_base
+            ),
+            Err(e) => {
+                info!("Failed to subscribe to topic: {:?} (get_client_addr)", e);
+                return None;
+            }
+        }
+        info!("メインスレッド: subscribe完了！ チャネルからの受信待ち… (get_client_addr)");
+
+        let client_addr_option = match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(encrypted_data) => {
+                info!(
+                    "メインスレッドで暗号化データゲットだぜ！ ({} bytes) (get_client_addr)",
+                    encrypted_data.len()
+                );
+                if let Some(client_addr_str) = self.decrypt_message(&encrypted_data) {
+                    match client_addr_str.parse::<SocketAddr>() {
+                        Ok(client_addr) => {
+                            info!(
+                                "クライアントアドレスの復号＆パース成功！ {} (get_client_addr)",
+                                client_addr
+                            );
+                            Some(client_addr)
+                        }
+                        Err(e) => {
+                            info!(
+                                "クライアントアドレスのパース失敗 '{}': {} (get_client_addr)",
+                                client_addr_str, e
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    info!("メッセージの復号失敗… (get_client_addr)");
+                    None
+                }
+            }
+            Err(e) => {
+                info!(
+                    "チャネルから暗号化データ受け取るの失敗した… (タイムアウトかも？) {} (get_client_addr)",
+                    e
+                );
+                None
+            }
+        };
+
+        // 必要ならここで unsubscribe とか client の終了処理を入れる
+        // client.unsubscribe(&client_topic_to_subscribe_base).unwrap_or_else(|e| info!("unsubscribe失敗: {:?} (get_client_addr)", e));
+        // drop(client);
+
+        if let Some(client_addr) = client_addr_option {
+            info!(
+                "クライアントにパンチングパケット送信開始 to {}",
+                client_addr
+            );
+            for _ in 0..5 {
+                if let Err(e) = socket.send_to(b"PU", client_addr) {
+                    info!("クライアントへのパンチングパケット送信失敗: {}", e);
+                    // 送信失敗しても、相手からのパケットは来るかもしれないから、ここでは return しないでおく？
+                    // それか、もうダメってことで None 返す？ 仕様によるね！
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            info!("クライアントへのパンチングパケット送信完了！");
+
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+                .unwrap_or_else(|e| {
+                    info!("クライアント側パンチング受信タイムアウト設定失敗: {}", e)
+                });
+            let mut buf = [0; 10];
+            let mut punch_received = false;
+            info!("クライアントからのパンチングパケット受信待機＆ゴミ掃除開始！");
+            for i in 0..8 {
+                match socket.recv_from(&mut buf) {
+                    Ok((amt, src)) => {
+                        if &buf[..amt] == b"PU" {
+                            info!(
+                                "サーバーからのパンチングパケット受信！({}) from {}",
+                                i + 1,
+                                src
+                            );
+                            punch_received = true;
+                            socket
+                                .set_read_timeout(Some(std::time::Duration::from_millis(50)))
+                                .unwrap_or_else(|e| {
+                                    info!("ゴミ掃除用タイムアウト設定失敗(client): {}", e)
+                                });
+                        } else {
+                            info!(
+                                "パンチングじゃないパケット受信(client) ({}): {:?} from {} (無視！)",
+                                i + 1,
+                                &buf[..amt],
+                                src
+                            );
+                        }
+                    }
+                    Err(ref e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        if punch_received {
+                            info!(
+                                "タイムアウトしたけどクライアントからのパンチング成功済み！({}) ゴミ掃除完了！(client)",
+                                i + 1
+                            );
+                        } else {
+                            info!(
+                                "タイムアウト…クライアントからのパンチングパケット来なかったっぽい…({}) (client)",
+                                i + 1
+                            );
+                        }
+                        break;
+                    }
+                    Err(e) => {
+                        info!(
+                            "クライアントからのパンチングパケット受信エラー ({}): {:?} (client)",
+                            i + 1,
+                            e
+                        );
+                        break;
+                    }
+                }
+            }
+            // クライアント側は、サーバーからのパンチングを受け取れなくても、自分のアドレスは返せる
+            // ゴミ掃除が終わったら、自分のアドレスを返す
+            return Some(client_addr);
+        }
+        None // client_addr_option が None だった場合
     }
 }
