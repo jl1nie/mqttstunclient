@@ -1,4 +1,4 @@
 [toolchain]
-#channel = "esp"
-channel = "stable"
+channel = "esp"
+#channel = "stable"
 components = ["rust-src"]

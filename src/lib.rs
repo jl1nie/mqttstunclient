@@ -4,6 +4,93 @@ use log::info;
 use std::convert::TryInto;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 
+/// ICE-like address candidates for NAT traversal
+/// Contains both local (host) and STUN-acquired (server reflexive) addresses
+#[derive(Debug, Clone)]
+pub struct AddressCandidates {
+    /// Local/private IP address (host candidate)
+    pub local: Option<SocketAddr>,
+    /// STUN-acquired public IP address (server reflexive candidate)
+    pub stun: Option<SocketAddr>,
+}
+
+impl AddressCandidates {
+    /// Create new candidates with both addresses
+    pub fn new(local: Option<SocketAddr>, stun: Option<SocketAddr>) -> Self {
+        Self { local, stun }
+    }
+
+    /// Serialize to MQTT payload format: "stun_addr,local_addr" or "stun_addr" or "local_addr"
+    pub fn to_payload(&self) -> String {
+        match (&self.stun, &self.local) {
+            (Some(stun), Some(local)) => format!("{},{}", stun, local),
+            (Some(stun), None) => format!("{}", stun),
+            (None, Some(local)) => format!("{}", local),
+            (None, None) => String::new(),
+        }
+    }
+
+    /// Parse from MQTT payload format
+    pub fn from_payload(payload: &str) -> Self {
+        let parts: Vec<&str> = payload.split(',').collect();
+        match parts.as_slice() {
+            [stun, local] => Self {
+                stun: stun.parse().ok(),
+                local: local.parse().ok(),
+            },
+            [single] => {
+                // Try to determine if it's local or STUN based on IP range
+                if let Ok(addr) = single.parse::<SocketAddr>() {
+                    if Self::is_private_ip(&addr) {
+                        Self {
+                            local: Some(addr),
+                            stun: None,
+                        }
+                    } else {
+                        Self {
+                            stun: Some(addr),
+                            local: None,
+                        }
+                    }
+                } else {
+                    Self {
+                        local: None,
+                        stun: None,
+                    }
+                }
+            }
+            _ => Self {
+                local: None,
+                stun: None,
+            },
+        }
+    }
+
+    /// Check if an address is in private IP range
+    fn is_private_ip(addr: &SocketAddr) -> bool {
+        match addr.ip() {
+            IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
+            IpAddr::V6(ip) => {
+                ip.is_loopback() // IPv6 private detection is more complex
+            }
+        }
+    }
+
+    /// Get all valid addresses as a vector, prioritizing local for same-LAN
+    pub fn to_vec(&self) -> Vec<SocketAddr> {
+        let mut addrs = Vec::new();
+        // Try local first (faster if on same LAN)
+        if let Some(local) = self.local {
+            addrs.push(local);
+        }
+        // Then STUN address
+        if let Some(stun) = self.stun {
+            addrs.push(stun);
+        }
+        addrs
+    }
+}
+
 pub struct MQTTStunClient {
     server_name: String,
     key: [u8; 32],
@@ -287,23 +374,142 @@ impl MQTTStunClient {
         None
     }
 
-    fn get_global_ip(&mut self, socket: &UdpSocket) -> Vec<u8> {
-        // グローバルIPアドレスを取得
-        let global_ip = self
-            .get_stun_addr(socket)
-            .expect("Failed to get global IP address");
+    /// Get local IP address by connecting to an external address (doesn't actually send data)
+    fn get_local_addr(socket: &UdpSocket) -> Option<SocketAddr> {
+        // Get the local address bound to this socket
+        match socket.local_addr() {
+            Ok(addr) => {
+                // If bound to 0.0.0.0, try to find the actual local IP
+                if addr.ip().is_unspecified() {
+                    // Create a temporary socket to determine the local IP
+                    // by "connecting" to an external address (no actual data sent)
+                    if let Ok(temp_socket) = UdpSocket::bind("0.0.0.0:0") {
+                        // Connect to Google's DNS - this doesn't send data, just sets the route
+                        if temp_socket.connect("8.8.8.8:53").is_ok()
+                            && let Ok(local) = temp_socket.local_addr()
+                        {
+                            let local_with_port = SocketAddr::new(local.ip(), addr.port());
+                            info!("Local IP Address (detected): {}", local_with_port);
+                            return Some(local_with_port);
+                        }
+                    }
+                    None
+                } else {
+                    info!("Local IP Address (bound): {}", addr);
+                    Some(addr)
+                }
+            }
+            Err(e) => {
+                info!("Failed to get local address: {}", e);
+                None
+            }
+        }
+    }
 
-        info!("Global IP Address: {}", global_ip);
+    /// Get both local and STUN addresses as candidates
+    fn get_address_candidates(&mut self, socket: &UdpSocket) -> AddressCandidates {
+        let local_addr = Self::get_local_addr(socket);
+        let stun_addr = self.get_stun_addr(socket);
 
-        // メッセージを暗号化
-        let message = format!("{}", global_ip);
+        info!(
+            "Address Candidates - Local: {:?}, STUN: {:?}",
+            local_addr, stun_addr
+        );
+
+        AddressCandidates::new(local_addr, stun_addr)
+    }
+
+    /// Get encrypted payload containing address candidates
+    fn get_address_payload(&mut self, socket: &UdpSocket) -> Vec<u8> {
+        let candidates = self.get_address_candidates(socket);
+        let message = candidates.to_payload();
+
+        if message.is_empty() {
+            panic!("Failed to get any IP address (both local and STUN failed)");
+        }
+
+        info!("Address payload: {}", message);
         self.encrypt_message(message.as_bytes())
+    }
+
+    /// Try UDP hole punching to multiple candidate addresses and return the first one that responds
+    fn try_punch_candidates(
+        socket: &UdpSocket,
+        candidates: &AddressCandidates,
+    ) -> Option<SocketAddr> {
+        let addrs = candidates.to_vec();
+        if addrs.is_empty() {
+            info!("No candidate addresses to punch");
+            return None;
+        }
+
+        info!(
+            "Trying UDP hole punching to {} candidates: {:?}",
+            addrs.len(),
+            addrs
+        );
+
+        // Send punching packets to all candidates
+        for _ in 0..5 {
+            for addr in &addrs {
+                if let Err(e) = socket.send_to(b"PU", addr) {
+                    info!("Failed to send punch to {}: {}", addr, e);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        // Wait for response from any candidate
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .unwrap_or_else(|e| info!("Failed to set read timeout: {}", e));
+
+        let mut buf = [0; 10];
+        let mut connected_addr: Option<SocketAddr> = None;
+
+        for _ in 0..10 {
+            match socket.recv_from(&mut buf) {
+                Ok((amt, src)) => {
+                    if &buf[..amt] == b"PU" {
+                        info!("Received punch response from {}", src);
+                        // Check if the source is one of our candidates
+                        if addrs.iter().any(|a| a.ip() == src.ip()) {
+                            connected_addr = Some(src);
+                            // Continue to drain remaining packets
+                            socket
+                                .set_read_timeout(Some(std::time::Duration::from_millis(50)))
+                                .unwrap_or_default();
+                        }
+                    } else {
+                        info!("Received unexpected packet from {}: {:?}", src, &buf[..amt]);
+                    }
+                }
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    break;
+                }
+                Err(e) => {
+                    info!("Error receiving punch response: {:?}", e);
+                    break;
+                }
+            }
+        }
+
+        if let Some(addr) = connected_addr {
+            info!("Successfully connected to {}", addr);
+        } else {
+            info!("No punch response received from any candidate");
+        }
+
+        connected_addr
     }
 
     #[cfg(feature = "rumqttc")]
     pub fn get_server_addr(&mut self, socket: &UdpSocket) -> Option<SocketAddr> {
         use rumqttc::{Client, Event, MqttOptions, Packet, QoS};
-        //self.mqtt_borker_urlからhost/portを取得
+
         let host = self
             .mqtt_broker_url
             .split("://")
@@ -327,10 +533,11 @@ impl MQTTStunClient {
         let mqttoptions = MqttOptions::new("wifikey-client", host, port);
         let (client, mut connection) = Client::new(mqttoptions, 10);
 
-        let client_addr = self.get_global_ip(socket); //self.get_my_mqtt_payload(socket).unwrap();
+        // Send our address candidates (both local and STUN)
+        let client_addr_payload = self.get_address_payload(socket);
         let ctopic = format!("{}{}", self.server_name, "/client");
         client
-            .publish(ctopic.clone(), QoS::AtLeastOnce, true, client_addr)
+            .publish(ctopic.clone(), QoS::AtLeastOnce, true, client_addr_payload)
             .unwrap();
 
         let topic = format!("{}{}", self.server_name, "/server");
@@ -342,61 +549,21 @@ impl MQTTStunClient {
                 if p.topic == topic
                     && let Some(peer_addr_str) = self.decrypt_message(&p.payload)
                 {
-                    match peer_addr_str.parse::<SocketAddr>() {
-                        Ok(peer_socket_addr) => {
-                            info!("Server Address: {}", peer_socket_addr);
-                            // UDPでピアにメッセージを送信
-                            for _ in 0..5 {
-                                socket.send_to(b"PU", peer_socket_addr).unwrap();
-                                std::thread::sleep(std::time::Duration::from_millis(100));
-                            }
-                            // パンチングパケットの受信と破棄
-                            socket
-                                .set_read_timeout(Some(std::time::Duration::from_millis(200)))
-                                .unwrap();
-                            let mut buf = [0; 10]; // 受信バッファ
-                            for _ in 0..5 {
-                                // 念のため複数回試行
-                                match socket.recv_from(&mut buf) {
-                                    Ok((amt, src)) => {
-                                        if &buf[..amt] == b"PU" {
-                                            info!("Received punching packet from {}", src);
-                                        } else {
-                                            // パンチングパケット以外はとりあえずログだけ
-                                            info!(
-                                                "Received unexpected packet from {}: {:?}",
-                                                src,
-                                                &buf[..amt]
-                                            );
-                                        }
-                                    }
-                                    Err(ref e)
-                                        if e.kind() == std::io::ErrorKind::WouldBlock
-                                            || e.kind() == std::io::ErrorKind::TimedOut =>
-                                    {
-                                        // タイムアウトならOK、ループを抜ける
-                                        break;
-                                    }
-                                    Err(e) => {
-                                        info!("Error receiving punching packet: {:?}", e);
-                                        break; // その他のエラー
-                                    }
-                                }
-                            }
-                            client
-                                .publish(ctopic.clone(), QoS::AtLeastOnce, true, Vec::new()) // 空メッセージで上書き！
-                                .unwrap();
-                            return Some(peer_socket_addr);
-                        }
-                        Err(e) => {
-                            info!("Failed to parse peer address '{}': {}", peer_addr_str, e);
-                            // パースに失敗した場合はループを続けるか、エラーを返すなど適宜処理
-                            // ここでは None を返さずに次のメッセージを待つ
-                        }
+                    // Parse as address candidates
+                    let candidates = AddressCandidates::from_payload(&peer_addr_str);
+                    info!("Received server candidates: {:?}", candidates);
+
+                    if let Some(connected_addr) = Self::try_punch_candidates(socket, &candidates) {
+                        client
+                            .publish(ctopic.clone(), QoS::AtLeastOnce, true, Vec::new())
+                            .unwrap();
+                        return Some(connected_addr);
+                    } else {
+                        info!("Failed to connect to any server candidate");
                     }
                 }
             } else {
-                info!("Error: {:?}", notification);
+                info!("MQTT event: {:?}", notification);
             }
         }
     }
@@ -404,7 +571,7 @@ impl MQTTStunClient {
     #[cfg(feature = "rumqttc")]
     pub fn get_client_addr(&mut self, socket: &UdpSocket) -> Option<SocketAddr> {
         use rumqttc::{Client, Event, MqttOptions, Packet, QoS};
-        //self.mqtt_borker_urlからhost/portを取得
+
         let host = self
             .mqtt_broker_url
             .split("://")
@@ -428,15 +595,16 @@ impl MQTTStunClient {
         let mqttoptions = MqttOptions::new("wifikey-server", host, port);
         let (client, mut connection) = Client::new(mqttoptions, 10);
 
-        let server_addr = self.get_global_ip(socket); //self.get_my_mqtt_payload(socket).unwrap();
-        let topic = format!("{}{}", self.server_name, "/server");
+        // Send our address candidates (both local and STUN)
+        let server_addr_payload = self.get_address_payload(socket);
+        let stopic = format!("{}{}", self.server_name, "/server");
         client
-            .publish(topic.clone(), QoS::AtLeastOnce, true, server_addr)
+            .publish(stopic.clone(), QoS::AtLeastOnce, true, server_addr_payload)
             .unwrap();
 
         let topic = format!("{}{}", self.server_name, "/client");
         client
-            .publish(topic.clone(), QoS::AtLeastOnce, true, Vec::new()) // 空メッセージで上書き！
+            .publish(topic.clone(), QoS::AtLeastOnce, true, Vec::new())
             .unwrap();
         client.subscribe(topic.clone(), QoS::AtLeastOnce).unwrap();
 
@@ -444,70 +612,38 @@ impl MQTTStunClient {
             let notification = connection.iter().next();
             if let Some(Ok(Event::Incoming(Packet::Publish(p)))) = notification {
                 if p.topic == topic
+                    && !p.payload.is_empty()
                     && let Some(peer_addr_str) = self.decrypt_message(&p.payload)
                 {
-                    match peer_addr_str.parse::<SocketAddr>() {
-                        Ok(peer_socket_addr) => {
-                            info!("Client Address: {}", peer_socket_addr);
-                            // UDPでピアにメッセージを送信
-                            for _ in 0..5 {
-                                socket.send_to(b"PU", peer_socket_addr).unwrap();
-                                std::thread::sleep(std::time::Duration::from_millis(100));
-                            }
-                            // パンチングパケットの受信と破棄
-                            socket
-                                .set_read_timeout(Some(std::time::Duration::from_millis(200)))
-                                .unwrap();
-                            let mut buf = [0; 10]; // 受信バッファ
-                            for _ in 0..5 {
-                                // 念のため複数回試行
-                                match socket.recv_from(&mut buf) {
-                                    Ok((amt, src)) => {
-                                        if &buf[..amt] == b"PU" {
-                                            info!("Received punching packet from {}", src);
-                                        } else {
-                                            info!(
-                                                "Received unexpected packet from {}: {:?}",
-                                                src,
-                                                &buf[..amt]
-                                            );
-                                        }
-                                    }
-                                    Err(ref e)
-                                        if e.kind() == std::io::ErrorKind::WouldBlock
-                                            || e.kind() == std::io::ErrorKind::TimedOut =>
-                                    {
-                                        break;
-                                    }
-                                    Err(e) => {
-                                        info!("Error receiving punching packet: {:?}", e);
-                                        break;
-                                    }
-                                }
-                            }
-                            return Some(peer_socket_addr);
-                        }
-                        Err(e) => {
-                            info!("Failed to parse peer address '{}': {}", peer_addr_str, e);
-                            return None;
-                        }
+                    // Parse as address candidates
+                    let candidates = AddressCandidates::from_payload(&peer_addr_str);
+                    info!("Received client candidates: {:?}", candidates);
+
+                    if let Some(connected_addr) = Self::try_punch_candidates(socket, &candidates) {
+                        return Some(connected_addr);
+                    } else {
+                        info!("Failed to connect to any client candidate");
+                        return None;
                     }
-                } else if p.topic != topic {
+                }
+            } else if let Some(Ok(Event::Incoming(Packet::Publish(p)))) = &notification {
+                if p.topic != topic {
                     info!("Invalid topic: {} != {}", p.topic, topic);
                 }
             } else {
-                info!("Other: {:?}", notification);
+                info!("MQTT event: {:?}", notification);
             }
         }
     }
 
     #[cfg(feature = "esp-idf-mqtt")]
     pub fn get_server_addr(&mut self, socket: &UdpSocket) -> Option<SocketAddr> {
-        use esp_idf_svc::mqtt::client::{EspMqttClient, Event, MqttClientConfiguration, QoS}; // Event を使う！
+        use esp_idf_svc::mqtt::client::{EspMqttClient, MqttClientConfiguration, QoS};
         use std::sync::mpsc;
         use std::thread;
 
-        let client_addr_payload = self.get_global_ip(socket);
+        // Get both local and STUN addresses
+        let client_addr_payload = self.get_address_payload(socket);
         let ctopic_base = format!("{}{}", self.server_name, "/client");
         let topic_to_subscribe_base = format!("{}{}", self.server_name, "/server");
 
@@ -593,34 +729,23 @@ impl MQTTStunClient {
         }
         info!("メインスレッド: subscribe完了！ チャネルからの受信待ち…");
 
-        let peer_addr_option = match rx.recv_timeout(std::time::Duration::from_secs(300)) {
+        let candidates_option = match rx.recv_timeout(std::time::Duration::from_secs(300)) {
             Ok(encrypted_data) => {
                 info!(
                     "メインスレッドで暗号化データゲットだぜ！ ({} bytes)",
                     encrypted_data.len()
                 );
                 if let Some(peer_addr_str) = self.decrypt_message(&encrypted_data) {
-                    match peer_addr_str.parse::<SocketAddr>() {
-                        Ok(peer_addr) => {
-                            info!("ピアアドレスの復号＆パース成功！ {}", peer_addr);
-                            match client.publish(
-                                &ctopic_for_empty_publish,
-                                QoS::AtLeastOnce,
-                                true,
-                                &[],
-                            ) {
-                                Ok(_) => {
-                                    info!("Published empty message to {}", ctopic_for_empty_publish)
-                                }
-                                Err(e) => info!("Failed to publish empty message: {:?}", e),
-                            }
-                            Some(peer_addr)
+                    // Parse as address candidates
+                    let candidates = AddressCandidates::from_payload(&peer_addr_str);
+                    info!("サーバーアドレス候補の復号成功！ {:?}", candidates);
+                    match client.publish(&ctopic_for_empty_publish, QoS::AtLeastOnce, true, &[]) {
+                        Ok(_) => {
+                            info!("Published empty message to {}", ctopic_for_empty_publish)
                         }
-                        Err(e) => {
-                            info!("ピアアドレスのパース失敗 '{}': {}", peer_addr_str, e);
-                            None
-                        }
+                        Err(e) => info!("Failed to publish empty message: {:?}", e),
                     }
+                    Some(candidates)
                 } else {
                     info!("メッセージの復号失敗…");
                     None
@@ -635,66 +760,13 @@ impl MQTTStunClient {
             }
         };
 
-        // 必要ならここで unsubscribe とか client の終了処理を入れる
-        // client.unsubscribe(&topic_to_subscribe_base).unwrap_or_else(|e| info!("unsubscribe失敗: {:?}", e));
-        // drop(client); // client を明示的にドロップして接続を閉じる (必要なら)
-        // TODO: スレッドを安全に停止させる方法も考えた方がいいかも (例: AtomicBool でフラグ立てるとか)
-
-        if let Some(peer_addr) = peer_addr_option {
-            for _ in 0..5 {
-                if let Err(e) = socket.send_to(b"PU", peer_addr) {
-                    info!("パンチングパケット送るの失敗… {}", e);
-                    return None;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            socket
-                .set_read_timeout(Some(std::time::Duration::from_millis(200)))
-                .unwrap_or_else(|e| info!("パンチング受信のタイムアウト設定失敗: {}", e));
-            let mut buf = [0; 10];
-            let mut punching_success = false;
-            for i in 0..8 {
-                match socket.recv_from(&mut buf) {
-                    Ok((amt, src)) => {
-                        if &buf[..amt] == b"PU" {
-                            info!("パンチングパケット受信した！ from {}", src);
-                            punching_success = true;
-                            // 1個受信成功したら、残りのループはゴミ掃除モードに移行するためにタイムアウトを短くする！
-                            socket
-                                .set_read_timeout(Some(std::time::Duration::from_millis(50)))
-                                .unwrap_or_else(|e| info!("ゴミ掃除用タイムアウト設定失敗: {}", e));
-                        } else {
-                            info!("なんか違うパケット来た from {}: {:?}", src, &buf[..amt]);
-                        }
-                    }
-                    Err(ref e)
-                        if e.kind() == std::io::ErrorKind::WouldBlock
-                            || e.kind() == std::io::ErrorKind::TimedOut =>
-                    {
-                        if punching_success {
-                            info!(
-                                "タイムアウトしたけどパンチング成功済み！({}) ゴミ掃除完了！",
-                                i + 1
-                            );
-                        } else {
-                            info!(
-                                "タイムアウト…パンチングパケット来なかったっぽい…({})",
-                                i + 1
-                            );
-                        }
-                        break; // タイムアウトならループ終了
-                    }
-                    Err(e) => {
-                        info!("パンチングパケット受信エラー: {:?}", e);
-                        break;
-                    }
-                }
-            }
-            if punching_success {
-                info!("パンチング処理完了！ソケットはキレイになったはず！✨");
-                return Some(peer_addr);
+        if let Some(candidates) = candidates_option {
+            // Try punching to all candidate addresses
+            if let Some(connected_addr) = Self::try_punch_candidates(socket, &candidates) {
+                info!("パンチング成功！接続先: {}", connected_addr);
+                return Some(connected_addr);
             } else {
-                info!("パンチング失敗…😢");
+                info!("全候補へのパンチング失敗…");
                 return None;
             }
         }
@@ -703,11 +775,12 @@ impl MQTTStunClient {
 
     #[cfg(feature = "esp-idf-mqtt")]
     pub fn get_client_addr(&mut self, socket: &UdpSocket) -> Option<SocketAddr> {
-        use esp_idf_svc::mqtt::client::{EspMqttClient, Event, MqttClientConfiguration, QoS}; // Event を使う！
+        use esp_idf_svc::mqtt::client::{EspMqttClient, MqttClientConfiguration, QoS};
         use std::sync::mpsc;
         use std::thread;
 
-        let server_addr_payload = self.get_global_ip(socket);
+        // Get both local and STUN addresses
+        let server_addr_payload = self.get_address_payload(socket);
         let server_topic_base = format!("{}{}", self.server_name, "/server");
         let client_topic_to_subscribe_base = format!("{}{}", self.server_name, "/client");
 
@@ -837,29 +910,20 @@ impl MQTTStunClient {
         }
         info!("メインスレッド: subscribe完了！ チャネルからの受信待ち… (get_client_addr)");
 
-        let client_addr_option = match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+        let candidates_option = match rx.recv_timeout(std::time::Duration::from_secs(30)) {
             Ok(encrypted_data) => {
                 info!(
                     "メインスレッドで暗号化データゲットだぜ！ ({} bytes) (get_client_addr)",
                     encrypted_data.len()
                 );
                 if let Some(client_addr_str) = self.decrypt_message(&encrypted_data) {
-                    match client_addr_str.parse::<SocketAddr>() {
-                        Ok(client_addr) => {
-                            info!(
-                                "クライアントアドレスの復号＆パース成功！ {} (get_client_addr)",
-                                client_addr
-                            );
-                            Some(client_addr)
-                        }
-                        Err(e) => {
-                            info!(
-                                "クライアントアドレスのパース失敗 '{}': {} (get_client_addr)",
-                                client_addr_str, e
-                            );
-                            None
-                        }
-                    }
+                    // Parse as address candidates
+                    let candidates = AddressCandidates::from_payload(&client_addr_str);
+                    info!(
+                        "クライアントアドレス候補の復号成功！ {:?} (get_client_addr)",
+                        candidates
+                    );
+                    Some(candidates)
                 } else {
                     info!("メッセージの復号失敗… (get_client_addr)");
                     None
@@ -874,88 +938,19 @@ impl MQTTStunClient {
             }
         };
 
-        // 必要ならここで unsubscribe とか client の終了処理を入れる
-        // client.unsubscribe(&client_topic_to_subscribe_base).unwrap_or_else(|e| info!("unsubscribe失敗: {:?} (get_client_addr)", e));
-        // drop(client);
-
-        if let Some(client_addr) = client_addr_option {
-            info!(
-                "クライアントにパンチングパケット送信開始 to {}",
-                client_addr
-            );
-            for _ in 0..5 {
-                if let Err(e) = socket.send_to(b"PU", client_addr) {
-                    info!("クライアントへのパンチングパケット送信失敗: {}", e);
-                    // 送信失敗しても、相手からのパケットは来るかもしれないから、ここでは return しないでおく？
-                    // それか、もうダメってことで None 返す？ 仕様によるね！
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
+        if let Some(candidates) = candidates_option {
+            // Try punching to all candidate addresses
+            if let Some(connected_addr) = Self::try_punch_candidates(socket, &candidates) {
+                info!(
+                    "クライアントへのパンチング成功！接続先: {} (get_client_addr)",
+                    connected_addr
+                );
+                return Some(connected_addr);
+            } else {
+                info!("全候補へのパンチング失敗… (get_client_addr)");
+                return None;
             }
-            info!("クライアントへのパンチングパケット送信完了！");
-
-            socket
-                .set_read_timeout(Some(std::time::Duration::from_millis(200)))
-                .unwrap_or_else(|e| {
-                    info!("クライアント側パンチング受信タイムアウト設定失敗: {}", e)
-                });
-            let mut buf = [0; 10];
-            let mut punch_received = false;
-            info!("クライアントからのパンチングパケット受信待機＆ゴミ掃除開始！");
-            for i in 0..8 {
-                match socket.recv_from(&mut buf) {
-                    Ok((amt, src)) => {
-                        if &buf[..amt] == b"PU" {
-                            info!(
-                                "サーバーからのパンチングパケット受信！({}) from {}",
-                                i + 1,
-                                src
-                            );
-                            punch_received = true;
-                            socket
-                                .set_read_timeout(Some(std::time::Duration::from_millis(50)))
-                                .unwrap_or_else(|e| {
-                                    info!("ゴミ掃除用タイムアウト設定失敗(client): {}", e)
-                                });
-                        } else {
-                            info!(
-                                "パンチングじゃないパケット受信(client) ({}): {:?} from {} (無視！)",
-                                i + 1,
-                                &buf[..amt],
-                                src
-                            );
-                        }
-                    }
-                    Err(ref e)
-                        if e.kind() == std::io::ErrorKind::WouldBlock
-                            || e.kind() == std::io::ErrorKind::TimedOut =>
-                    {
-                        if punch_received {
-                            info!(
-                                "タイムアウトしたけどクライアントからのパンチング成功済み！({}) ゴミ掃除完了！(client)",
-                                i + 1
-                            );
-                        } else {
-                            info!(
-                                "タイムアウト…クライアントからのパンチングパケット来なかったっぽい…({}) (client)",
-                                i + 1
-                            );
-                        }
-                        break;
-                    }
-                    Err(e) => {
-                        info!(
-                            "クライアントからのパンチングパケット受信エラー ({}): {:?} (client)",
-                            i + 1,
-                            e
-                        );
-                        break;
-                    }
-                }
-            }
-            // クライアント側は、サーバーからのパンチングを受け取れなくても、自分のアドレスは返せる
-            // ゴミ掃除が終わったら、自分のアドレスを返す
-            return Some(client_addr);
         }
-        None // client_addr_option が None だった場合
+        None
     }
 }
