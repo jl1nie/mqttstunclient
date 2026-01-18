@@ -42,24 +42,34 @@ impl AddressCandidates {
                 // Try to determine if it's local or STUN based on IP range
                 if let Ok(addr) = single.parse::<SocketAddr>() {
                     if Self::is_private_ip(&addr) {
-                        Self { local: Some(addr), stun: None }
+                        Self {
+                            local: Some(addr),
+                            stun: None,
+                        }
                     } else {
-                        Self { stun: Some(addr), local: None }
+                        Self {
+                            stun: Some(addr),
+                            local: None,
+                        }
                     }
                 } else {
-                    Self { local: None, stun: None }
+                    Self {
+                        local: None,
+                        stun: None,
+                    }
                 }
             }
-            _ => Self { local: None, stun: None },
+            _ => Self {
+                local: None,
+                stun: None,
+            },
         }
     }
 
     /// Check if an address is in private IP range
     fn is_private_ip(addr: &SocketAddr) -> bool {
         match addr.ip() {
-            IpAddr::V4(ip) => {
-                ip.is_private() || ip.is_loopback() || ip.is_link_local()
-            }
+            IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
             IpAddr::V6(ip) => {
                 ip.is_loopback() // IPv6 private detection is more complex
             }
@@ -423,14 +433,21 @@ impl MQTTStunClient {
     }
 
     /// Try UDP hole punching to multiple candidate addresses and return the first one that responds
-    fn try_punch_candidates(socket: &UdpSocket, candidates: &AddressCandidates) -> Option<SocketAddr> {
+    fn try_punch_candidates(
+        socket: &UdpSocket,
+        candidates: &AddressCandidates,
+    ) -> Option<SocketAddr> {
         let addrs = candidates.to_vec();
         if addrs.is_empty() {
             info!("No candidate addresses to punch");
             return None;
         }
 
-        info!("Trying UDP hole punching to {} candidates: {:?}", addrs.len(), addrs);
+        info!(
+            "Trying UDP hole punching to {} candidates: {:?}",
+            addrs.len(),
+            addrs
+        );
 
         // Send punching packets to all candidates
         for _ in 0..5 {
@@ -722,12 +739,7 @@ impl MQTTStunClient {
                     // Parse as address candidates
                     let candidates = AddressCandidates::from_payload(&peer_addr_str);
                     info!("サーバーアドレス候補の復号成功！ {:?}", candidates);
-                    match client.publish(
-                        &ctopic_for_empty_publish,
-                        QoS::AtLeastOnce,
-                        true,
-                        &[],
-                    ) {
+                    match client.publish(&ctopic_for_empty_publish, QoS::AtLeastOnce, true, &[]) {
                         Ok(_) => {
                             info!("Published empty message to {}", ctopic_for_empty_publish)
                         }
@@ -928,7 +940,10 @@ impl MQTTStunClient {
         if let Some(candidates) = candidates_option {
             // Try punching to all candidate addresses
             if let Some(connected_addr) = Self::try_punch_candidates(socket, &candidates) {
-                info!("クライアントへのパンチング成功！接続先: {} (get_client_addr)", connected_addr);
+                info!(
+                    "クライアントへのパンチング成功！接続先: {} (get_client_addr)",
+                    connected_addr
+                );
                 return Some(connected_addr);
             } else {
                 info!("全候補へのパンチング失敗… (get_client_addr)");
