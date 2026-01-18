@@ -23,9 +23,9 @@ impl AddressCandidates {
     /// Serialize to MQTT payload format: "stun_addr,local_addr" or "stun_addr" or "local_addr"
     pub fn to_payload(&self) -> String {
         match (&self.stun, &self.local) {
-            (Some(stun), Some(local)) => format!("{},{}", stun, local),
-            (Some(stun), None) => format!("{}", stun),
-            (None, Some(local)) => format!("{}", local),
+            (Some(stun), Some(local)) => format!("{stun},{local}"),
+            (Some(stun), None) => format!("{stun}"),
+            (None, Some(local)) => format!("{local}"),
             (None, None) => String::new(),
         }
     }
@@ -127,10 +127,7 @@ impl MQTTStunClient {
             .unwrap_or("mqtt://broker.emqx.io:1883")
             .to_string();
 
-        info!(
-            "STUN Sever: {} MQTT Topic: {} Broker: {}",
-            stun_server_addr, server_name, mqtt_broker_url
-        );
+        info!("STUN Sever: {stun_server_addr} MQTT Topic: {server_name} Broker: {mqtt_broker_url}");
 
         Self {
             server_name,
@@ -217,7 +214,7 @@ impl MQTTStunClient {
 
         if magic_cookie != MQTTStunClient::STUN_MAGIC_COOKIE {
             // おまじないが違う！ニセモノかも？
-            info!("STUN: おまじないが違うよ！ {:x}", magic_cookie);
+            info!("STUN: おまじないが違うよ！ {magic_cookie:x}");
             return None;
         }
         if &transaction_id != expected_transaction_id {
@@ -228,7 +225,7 @@ impl MQTTStunClient {
 
         // 0x0101 は「成功したよ！」って意味
         if msg_type != 0x0101 {
-            info!("STUN: 成功じゃなかったみたい… {:x}", msg_type);
+            info!("STUN: 成功じゃなかったみたい… {msg_type:x}");
             return None;
         }
 
@@ -260,7 +257,7 @@ impl MQTTStunClient {
                     let port = u16::from_be_bytes(attr_value[2..4].try_into().ok()?);
                     let ip_bytes: [u8; 4] = attr_value[4..8].try_into().ok()?;
                     let ip = IpAddr::from(ip_bytes);
-                    info!("STUN: MAPPED-ADDRESSゲット！ {}:{}", ip, port);
+                    info!("STUN: MAPPED-ADDRESSゲット！ {ip}:{port}");
                     return Some(SocketAddr::new(ip, port));
                 }
             } else if attr_type == MQTTStunClient::STUN_ATTR_XOR_MAPPED_ADDRESS {
@@ -283,7 +280,7 @@ impl MQTTStunClient {
                         ip_bytes[i] = xor_ip_bytes[i] ^ magic_cookie_all_bytes[i];
                     }
                     let ip = IpAddr::from(ip_bytes);
-                    info!("STUN: XOR-MAPPED-ADDRESSゲット！ {}:{}", ip, port);
+                    info!("STUN: XOR-MAPPED-ADDRESSゲット！ {ip}:{port}");
                     return Some(SocketAddr::new(ip, port));
                 }
             }
@@ -303,7 +300,7 @@ impl MQTTStunClient {
         // このソケット、他でも使ってるから元の設定に戻すの忘れないでね！
         let original_timeout = socket.read_timeout().unwrap_or(None);
         if let Err(e) = socket.set_read_timeout(Some(std::time::Duration::from_secs(3))) {
-            info!("STUN: ソケットのタイムアウト設定失敗… {}", e);
+            info!("STUN: ソケットのタイムアウト設定失敗… {e}");
             // ま、いっか、とりあえず進も！
         }
 
@@ -311,12 +308,12 @@ impl MQTTStunClient {
         for attempt in 0..MAX_RETRIES {
             info!("STUN: トライ {}回目！", attempt + 1);
             if let Err(e) = socket.send_to(&request_payload, self.stun_server_addr) {
-                info!("STUN: 「教えてー！」って送るの失敗した… {:?}", e);
+                info!("STUN: 「教えてー！」って送るの失敗した… {e:?}");
                 if attempt == MAX_RETRIES - 1 {
                     // もう後がない！
                     socket
                         .set_read_timeout(original_timeout)
-                        .unwrap_or_else(|e| info!("STUN: タイムアウト戻すのも失敗した… {}", e));
+                        .unwrap_or_else(|e| info!("STUN: タイムアウト戻すのも失敗した… {e}"));
                     return None;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(200 * (attempt as u64 + 1))); // ちょっと待ってリトライ
@@ -331,10 +328,10 @@ impl MQTTStunClient {
             let mut buf = [0u8; 512]; // 返事はこのくらいあれば足りるっしょ
             match socket.recv_from(&mut buf) {
                 Ok((amt, src)) => {
-                    info!("STUN: 返事キタ！ {} bytes from {}", amt, src);
+                    info!("STUN: 返事キタ！ {amt} bytes from {src}");
                     socket
                         .set_read_timeout(original_timeout)
-                        .unwrap_or_else(|e| info!("STUN: タイムアウト戻すの失敗… {}", e)); // とりあえずタイムアウト設定戻しとこ
+                        .unwrap_or_else(|e| info!("STUN: タイムアウト戻すの失敗… {e}")); // とりあえずタイムアウト設定戻しとこ
 
                     // if src != stun_server_addr { // 違うとこから返事きたら…まぁいっか今回は！
                     //     info!("STUN: あれ、違う人から返事きた？ {}", src);
@@ -343,7 +340,7 @@ impl MQTTStunClient {
                     if let Some(mapped_addr) =
                         MQTTStunClient::parse_stun_binding_response(response_data, &transaction_id)
                     {
-                        info!("STUN: やった！自分の住所わかった！ {}", mapped_addr);
+                        info!("STUN: やった！自分の住所わかった！ {mapped_addr}");
                         return Some(mapped_addr);
                     } else {
                         info!("STUN: 返事きたけど、よくわかんなかった…");
@@ -357,7 +354,7 @@ impl MQTTStunClient {
                         // これでダメなら諦めよ…
                         socket
                             .set_read_timeout(original_timeout)
-                            .unwrap_or_else(|e| info!("STUN: タイムアウト戻すの失敗… {}", e));
+                            .unwrap_or_else(|e| info!("STUN: タイムアウト戻すの失敗… {e}"));
                         return None;
                     }
                     // タイムアウトならリトライ
@@ -369,7 +366,7 @@ impl MQTTStunClient {
         // ここまで来ちゃったらダメだったってこと
         socket
             .set_read_timeout(original_timeout)
-            .unwrap_or_else(|e| info!("STUN: 最後にタイムアウト戻すのも失敗… {}", e));
+            .unwrap_or_else(|e| info!("STUN: 最後にタイムアウト戻すのも失敗… {e}"));
         info!("STUN: 何回やってもダメだったわ…");
         None
     }
@@ -389,18 +386,18 @@ impl MQTTStunClient {
                             && let Ok(local) = temp_socket.local_addr()
                         {
                             let local_with_port = SocketAddr::new(local.ip(), addr.port());
-                            info!("Local IP Address (detected): {}", local_with_port);
+                            info!("Local IP Address (detected): {local_with_port}");
                             return Some(local_with_port);
                         }
                     }
                     None
                 } else {
-                    info!("Local IP Address (bound): {}", addr);
+                    info!("Local IP Address (bound): {addr}");
                     Some(addr)
                 }
             }
             Err(e) => {
-                info!("Failed to get local address: {}", e);
+                info!("Failed to get local address: {e}");
                 None
             }
         }
@@ -411,10 +408,7 @@ impl MQTTStunClient {
         let local_addr = Self::get_local_addr(socket);
         let stun_addr = self.get_stun_addr(socket);
 
-        info!(
-            "Address Candidates - Local: {:?}, STUN: {:?}",
-            local_addr, stun_addr
-        );
+        info!("Address Candidates - Local: {local_addr:?}, STUN: {stun_addr:?}");
 
         AddressCandidates::new(local_addr, stun_addr)
     }
@@ -428,7 +422,7 @@ impl MQTTStunClient {
             panic!("Failed to get any IP address (both local and STUN failed)");
         }
 
-        info!("Address payload: {}", message);
+        info!("Address payload: {message}");
         self.encrypt_message(message.as_bytes())
     }
 
@@ -453,7 +447,7 @@ impl MQTTStunClient {
         for _ in 0..5 {
             for addr in &addrs {
                 if let Err(e) = socket.send_to(b"PU", addr) {
-                    info!("Failed to send punch to {}: {}", addr, e);
+                    info!("Failed to send punch to {addr}: {e}");
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -462,7 +456,7 @@ impl MQTTStunClient {
         // Wait for response from any candidate
         socket
             .set_read_timeout(Some(std::time::Duration::from_millis(500)))
-            .unwrap_or_else(|e| info!("Failed to set read timeout: {}", e));
+            .unwrap_or_else(|e| info!("Failed to set read timeout: {e}"));
 
         let mut buf = [0; 10];
         let mut connected_addr: Option<SocketAddr> = None;
@@ -471,7 +465,7 @@ impl MQTTStunClient {
             match socket.recv_from(&mut buf) {
                 Ok((amt, src)) => {
                     if &buf[..amt] == b"PU" {
-                        info!("Received punch response from {}", src);
+                        info!("Received punch response from {src}");
                         // Check if the source is one of our candidates
                         if addrs.iter().any(|a| a.ip() == src.ip()) {
                             connected_addr = Some(src);
@@ -491,14 +485,14 @@ impl MQTTStunClient {
                     break;
                 }
                 Err(e) => {
-                    info!("Error receiving punch response: {:?}", e);
+                    info!("Error receiving punch response: {e:?}");
                     break;
                 }
             }
         }
 
         if let Some(addr) = connected_addr {
-            info!("Successfully connected to {}", addr);
+            info!("Successfully connected to {addr}");
         } else {
             info!("No punch response received from any candidate");
         }
@@ -653,7 +647,7 @@ impl MQTTStunClient {
         let (mut client, mut connection) = match EspMqttClient::new(broker_url, &mqtt_config) {
             Ok(c) => c,
             Err(e) => {
-                info!("メインスレッドでMQTTクライアント作成失敗: {:?}", e);
+                info!("メインスレッドでMQTTクライアント作成失敗: {e:?}");
                 return None;
             }
         };
@@ -683,7 +677,7 @@ impl MQTTStunClient {
                             } if recv_topic == topic_to_subscribe_for_thread => {
                                 info!("暗号化されたデータ受信！ ({} bytes)", data.len());
                                 if let Err(e) = tx.send(data.to_vec()) {
-                                    info!("チャネルに暗号化データ送るの失敗した… {}", e);
+                                    info!("チャネルに暗号化データ送るの失敗した… {e}");
                                     return; // 送信失敗ならスレッド終了
                                 }
                                 info!("暗号化データ送信完了、スレッドの役目は一旦終わり！");
@@ -702,7 +696,7 @@ impl MQTTStunClient {
                         }
                     }
                     Err(e) => {
-                        info!("MQTT Error in thread's event loop: {:?}", e);
+                        info!("MQTT Error in thread's event loop: {e:?}");
                         return; // エラーならスレッド終了
                     }
                 }
@@ -712,18 +706,18 @@ impl MQTTStunClient {
 
         info!("メインスレッド: publish開始！");
         match client.publish(&ctopic_base, QoS::AtLeastOnce, true, &client_addr_payload) {
-            Ok(_) => info!("Published client address to {}", ctopic_base),
+            Ok(_) => info!("Published client address to {ctopic_base}"),
             Err(e) => {
-                info!("Failed to publish client address: {:?}", e);
+                info!("Failed to publish client address: {e:?}");
                 return None;
             }
         }
         info!("メインスレッド: publish完了！ subscribe開始！");
 
         match client.subscribe(&topic_to_subscribe_base, QoS::AtLeastOnce) {
-            Ok(_) => info!("Subscribed to {}", topic_to_subscribe_base),
+            Ok(_) => info!("Subscribed to {topic_to_subscribe_base}"),
             Err(e) => {
-                info!("Failed to subscribe to topic: {:?}", e);
+                info!("Failed to subscribe to topic: {e:?}");
                 return None;
             }
         }
@@ -738,12 +732,12 @@ impl MQTTStunClient {
                 if let Some(peer_addr_str) = self.decrypt_message(&encrypted_data) {
                     // Parse as address candidates
                     let candidates = AddressCandidates::from_payload(&peer_addr_str);
-                    info!("サーバーアドレス候補の復号成功！ {:?}", candidates);
+                    info!("サーバーアドレス候補の復号成功！ {candidates:?}");
                     match client.publish(&ctopic_for_empty_publish, QoS::AtLeastOnce, true, &[]) {
                         Ok(_) => {
-                            info!("Published empty message to {}", ctopic_for_empty_publish)
+                            info!("Published empty message to {ctopic_for_empty_publish}")
                         }
-                        Err(e) => info!("Failed to publish empty message: {:?}", e),
+                        Err(e) => info!("Failed to publish empty message: {e:?}"),
                     }
                     Some(candidates)
                 } else {
@@ -752,10 +746,7 @@ impl MQTTStunClient {
                 }
             }
             Err(e) => {
-                info!(
-                    "チャネルから暗号化データ受け取るの失敗した… (タイムアウトかも？) {}",
-                    e
-                );
+                info!("チャネルから暗号化データ受け取るの失敗した… (タイムアウトかも？) {e}");
                 None
             }
         };
@@ -763,7 +754,7 @@ impl MQTTStunClient {
         if let Some(candidates) = candidates_option {
             // Try punching to all candidate addresses
             if let Some(connected_addr) = Self::try_punch_candidates(socket, &candidates) {
-                info!("パンチング成功！接続先: {}", connected_addr);
+                info!("パンチング成功！接続先: {connected_addr}");
                 return Some(connected_addr);
             } else {
                 info!("全候補へのパンチング失敗…");
@@ -793,10 +784,7 @@ impl MQTTStunClient {
         let (mut client, mut connection) = match EspMqttClient::new(broker_url, &mqtt_config) {
             Ok(c) => c,
             Err(e) => {
-                info!(
-                    "メインスレッドでMQTTクライアント作成失敗 (get_client_addr): {:?}",
-                    e
-                );
+                info!("メインスレッドでMQTTクライアント作成失敗 (get_client_addr): {e:?}");
                 return None;
             }
         };
@@ -830,8 +818,7 @@ impl MQTTStunClient {
                                 );
                                 if let Err(e) = tx.send(data.to_vec()) {
                                     info!(
-                                        "チャネルに暗号化データ送るの失敗した… {}(get_client_addr)",
-                                        e
+                                        "チャネルに暗号化データ送るの失敗した… {e}(get_client_addr)"
                                     );
                                     return;
                                 }
@@ -853,10 +840,7 @@ impl MQTTStunClient {
                         }
                     }
                     Err(e) => {
-                        info!(
-                            "MQTT Error in thread's event loop: {:?} (get_client_addr)",
-                            e
-                        );
+                        info!("MQTT Error in thread's event loop: {e:?} (get_client_addr)");
                         return;
                     }
                 }
@@ -870,40 +854,27 @@ impl MQTTStunClient {
             true,
             &server_addr_payload,
         ) {
-            Ok(_) => info!(
-                "Published server address to {} (get_client_addr)",
-                server_topic_base
-            ),
+            Ok(_) => info!("Published server address to {server_topic_base} (get_client_addr)"),
             Err(e) => {
-                info!(
-                    "Failed to publish server address: {:?} (get_client_addr)",
-                    e
-                );
+                info!("Failed to publish server address: {e:?} (get_client_addr)");
                 return None;
             }
         }
 
         match client.publish(&client_topic_to_subscribe_base, QoS::AtLeastOnce, true, &[]) {
             Ok(_) => info!(
-                "Published empty message to {} (get_client_addr)",
-                client_topic_to_subscribe_base
+                "Published empty message to {client_topic_to_subscribe_base} (get_client_addr)"
             ),
             Err(e) => {
-                info!(
-                    "Failed to publish empty message to client topic: {:?} (get_client_addr)",
-                    e
-                );
+                info!("Failed to publish empty message to client topic: {e:?} (get_client_addr)");
             }
         }
         info!("メインスレッド: publish完了！ subscribe開始！ (get_client_addr)");
 
         match client.subscribe(&client_topic_to_subscribe_base, QoS::AtLeastOnce) {
-            Ok(_) => info!(
-                "Subscribed to {} (get_client_addr)",
-                client_topic_to_subscribe_base
-            ),
+            Ok(_) => info!("Subscribed to {client_topic_to_subscribe_base} (get_client_addr)"),
             Err(e) => {
-                info!("Failed to subscribe to topic: {:?} (get_client_addr)", e);
+                info!("Failed to subscribe to topic: {e:?} (get_client_addr)");
                 return None;
             }
         }
@@ -918,10 +889,7 @@ impl MQTTStunClient {
                 if let Some(client_addr_str) = self.decrypt_message(&encrypted_data) {
                     // Parse as address candidates
                     let candidates = AddressCandidates::from_payload(&client_addr_str);
-                    info!(
-                        "クライアントアドレス候補の復号成功！ {:?} (get_client_addr)",
-                        candidates
-                    );
+                    info!("クライアントアドレス候補の復号成功！ {candidates:?} (get_client_addr)");
                     Some(candidates)
                 } else {
                     info!("メッセージの復号失敗… (get_client_addr)");
@@ -930,8 +898,7 @@ impl MQTTStunClient {
             }
             Err(e) => {
                 info!(
-                    "チャネルから暗号化データ受け取るの失敗した… (タイムアウトかも？) {} (get_client_addr)",
-                    e
+                    "チャネルから暗号化データ受け取るの失敗した… (タイムアウトかも？) {e} (get_client_addr)"
                 );
                 None
             }
@@ -940,10 +907,7 @@ impl MQTTStunClient {
         if let Some(candidates) = candidates_option {
             // Try punching to all candidate addresses
             if let Some(connected_addr) = Self::try_punch_candidates(socket, &candidates) {
-                info!(
-                    "クライアントへのパンチング成功！接続先: {} (get_client_addr)",
-                    connected_addr
-                );
+                info!("クライアントへのパンチング成功！接続先: {connected_addr} (get_client_addr)");
                 return Some(connected_addr);
             } else {
                 info!("全候補へのパンチング失敗… (get_client_addr)");

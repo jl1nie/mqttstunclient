@@ -15,29 +15,22 @@ fn main() {
             s
         }
         Err(e) => {
-            eprintln!(
-                "UDPソケットのバインド失敗とか、マジありえないんだけど…💀: {}",
-                e
-            );
+            eprintln!("UDPソケットのバインド失敗とか、マジありえないんだけど…💀: {e}");
             return;
         }
     };
 
     // サーバーのアドレスをMQTT経由でゲット！（この中でホールパンチングもしてるはず！）
     if let Some(server_addr) = client_logic.get_server_addr(&udp_socket) {
-        println!(
-            "\nやったー！サーバーのアドレス {} をゲットだぜ！✨",
-            server_addr
-        );
+        println!("\nやったー！サーバーのアドレス {server_addr} をゲットだぜ！✨");
 
         let message = "クライアントから愛のメッセージ！届けー！💌";
-        println!("「{}」ってメッセージをサーバーに送るよ！", message);
+        println!("「{message}」ってメッセージをサーバーに送るよ！");
 
         match udp_socket.send_to(message.as_bytes(), server_addr) {
             Ok(bytes_sent) => {
                 println!(
-                    "{} バイトのメッセージ送信成功！サーバーからの返事、待ってみる？🤔",
-                    bytes_sent
+                    "{bytes_sent} バイトのメッセージ送信成功！サーバーからの返事、待ってみる？🤔"
                 );
 
                 // サーバーからの返信を待つ！ドキドキ…
@@ -49,20 +42,15 @@ fn main() {
                 match udp_socket.recv_from(&mut receive_buffer) {
                     Ok((number_of_bytes, source_addr)) => {
                         println!(
-                            "\nキタ――(ﾟ∀ﾟ)――!! サーバー {} から {} バイトの返信きたぁぁぁ！💌",
-                            source_addr, number_of_bytes
+                            "\nキタ――(ﾟ∀ﾟ)――!! サーバー {source_addr} から {number_of_bytes} バイトの返信きたぁぁぁ！💌"
                         );
                         let received_message =
                             String::from_utf8_lossy(&receive_buffer[..number_of_bytes]);
-                        println!(
-                            "サーバーからのメッセージ: 「{}」やったね！🎉",
-                            received_message
-                        );
+                        println!("サーバーからのメッセージ: 「{received_message}」やったね！🎉");
                     }
                     Err(e) => {
                         eprintln!(
-                            "\nあちゃー、サーバーからの返信、受信失敗…しょぼんぬ…(´・ω・｀): {}",
-                            e
+                            "\nあちゃー、サーバーからの返信、受信失敗…しょぼんぬ…(´・ω・｀): {e}"
                         );
                         println!("サーバー忙しかったんかな…？それか、まだNATの壁が厚いとか…？🤔");
                     }
@@ -70,8 +58,7 @@ fn main() {
             }
             Err(e) => {
                 eprintln!(
-                    "\nうわーん、メッセージ送信失敗…Connection refused とか言われたんだけど？！ぴえん🥺: {}",
-                    e
+                    "\nうわーん、メッセージ送信失敗…Connection refused とか言われたんだけど？！ぴえん🥺: {e}"
                 );
                 println!("もしかしてサーバー側がまだ準備できてないとか、ファイアウォールとか…？");
             }
