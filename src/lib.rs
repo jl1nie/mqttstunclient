@@ -33,7 +33,7 @@ impl MQTTStunClient {
             .unwrap_or("stun.l.google.com:19302")
             .to_socket_addrs()
             .ok()
-            .and_then(|iter| iter.filter(|addr| addr.is_ipv4()).next()) // IPv4アドレスだけフィルタリング！
+            .and_then(|mut iter| iter.find(|addr| addr.is_ipv4())) // IPv4アドレスだけフィルタリング！
             .expect("STUN server IPv4 address not found."); // 見つからなかったらパニック！
 
         let mqtt_broker_url = mqtt_broker_url
@@ -339,59 +339,59 @@ impl MQTTStunClient {
         loop {
             let notification = connection.iter().next();
             if let Some(Ok(Event::Incoming(Packet::Publish(p)))) = notification {
-                if p.topic == topic {
-                    if let Some(peer_addr_str) = self.decrypt_message(&p.payload) {
-                        match peer_addr_str.parse::<SocketAddr>() {
-                            Ok(peer_socket_addr) => {
-                                info!("Server Address: {}", peer_socket_addr);
-                                // UDPでピアにメッセージを送信
-                                for _ in 0..5 {
-                                    socket.send_to(b"PU", peer_socket_addr).unwrap();
-                                    std::thread::sleep(std::time::Duration::from_millis(100));
-                                }
-                                // パンチングパケットの受信と破棄
-                                socket
-                                    .set_read_timeout(Some(std::time::Duration::from_millis(200)))
-                                    .unwrap();
-                                let mut buf = [0; 10]; // 受信バッファ
-                                for _ in 0..5 {
-                                    // 念のため複数回試行
-                                    match socket.recv_from(&mut buf) {
-                                        Ok((amt, src)) => {
-                                            if &buf[..amt] == b"PU" {
-                                                info!("Received punching packet from {}", src);
-                                            } else {
-                                                // パンチングパケット以外はとりあえずログだけ
-                                                info!(
-                                                    "Received unexpected packet from {}: {:?}",
-                                                    src,
-                                                    &buf[..amt]
-                                                );
-                                            }
-                                        }
-                                        Err(ref e)
-                                            if e.kind() == std::io::ErrorKind::WouldBlock
-                                                || e.kind() == std::io::ErrorKind::TimedOut =>
-                                        {
-                                            // タイムアウトならOK、ループを抜ける
-                                            break;
-                                        }
-                                        Err(e) => {
-                                            info!("Error receiving punching packet: {:?}", e);
-                                            break; // その他のエラー
+                if p.topic == topic
+                    && let Some(peer_addr_str) = self.decrypt_message(&p.payload)
+                {
+                    match peer_addr_str.parse::<SocketAddr>() {
+                        Ok(peer_socket_addr) => {
+                            info!("Server Address: {}", peer_socket_addr);
+                            // UDPでピアにメッセージを送信
+                            for _ in 0..5 {
+                                socket.send_to(b"PU", peer_socket_addr).unwrap();
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                            }
+                            // パンチングパケットの受信と破棄
+                            socket
+                                .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+                                .unwrap();
+                            let mut buf = [0; 10]; // 受信バッファ
+                            for _ in 0..5 {
+                                // 念のため複数回試行
+                                match socket.recv_from(&mut buf) {
+                                    Ok((amt, src)) => {
+                                        if &buf[..amt] == b"PU" {
+                                            info!("Received punching packet from {}", src);
+                                        } else {
+                                            // パンチングパケット以外はとりあえずログだけ
+                                            info!(
+                                                "Received unexpected packet from {}: {:?}",
+                                                src,
+                                                &buf[..amt]
+                                            );
                                         }
                                     }
+                                    Err(ref e)
+                                        if e.kind() == std::io::ErrorKind::WouldBlock
+                                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                                    {
+                                        // タイムアウトならOK、ループを抜ける
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        info!("Error receiving punching packet: {:?}", e);
+                                        break; // その他のエラー
+                                    }
                                 }
-                                client
-                                    .publish(ctopic.clone(), QoS::AtLeastOnce, true, Vec::new()) // 空メッセージで上書き！
-                                    .unwrap();
-                                return Some(peer_socket_addr);
                             }
-                            Err(e) => {
-                                info!("Failed to parse peer address '{}': {}", peer_addr_str, e);
-                                // パースに失敗した場合はループを続けるか、エラーを返すなど適宜処理
-                                // ここでは None を返さずに次のメッセージを待つ
-                            }
+                            client
+                                .publish(ctopic.clone(), QoS::AtLeastOnce, true, Vec::new()) // 空メッセージで上書き！
+                                .unwrap();
+                            return Some(peer_socket_addr);
+                        }
+                        Err(e) => {
+                            info!("Failed to parse peer address '{}': {}", peer_addr_str, e);
+                            // パースに失敗した場合はループを続けるか、エラーを返すなど適宜処理
+                            // ここでは None を返さずに次のメッセージを待つ
                         }
                     }
                 }
@@ -443,56 +443,56 @@ impl MQTTStunClient {
         loop {
             let notification = connection.iter().next();
             if let Some(Ok(Event::Incoming(Packet::Publish(p)))) = notification {
-                if p.topic == topic {
-                    if let Some(peer_addr_str) = self.decrypt_message(&p.payload) {
-                        match peer_addr_str.parse::<SocketAddr>() {
-                            Ok(peer_socket_addr) => {
-                                info!("Client Address: {}", peer_socket_addr);
-                                // UDPでピアにメッセージを送信
-                                for _ in 0..5 {
-                                    socket.send_to(b"PU", peer_socket_addr).unwrap();
-                                    std::thread::sleep(std::time::Duration::from_millis(100));
-                                }
-                                // パンチングパケットの受信と破棄
-                                socket
-                                    .set_read_timeout(Some(std::time::Duration::from_millis(200)))
-                                    .unwrap();
-                                let mut buf = [0; 10]; // 受信バッファ
-                                for _ in 0..5 {
-                                    // 念のため複数回試行
-                                    match socket.recv_from(&mut buf) {
-                                        Ok((amt, src)) => {
-                                            if &buf[..amt] == b"PU" {
-                                                info!("Received punching packet from {}", src);
-                                            } else {
-                                                info!(
-                                                    "Received unexpected packet from {}: {:?}",
-                                                    src,
-                                                    &buf[..amt]
-                                                );
-                                            }
-                                        }
-                                        Err(ref e)
-                                            if e.kind() == std::io::ErrorKind::WouldBlock
-                                                || e.kind() == std::io::ErrorKind::TimedOut =>
-                                        {
-                                            break;
-                                        }
-                                        Err(e) => {
-                                            info!("Error receiving punching packet: {:?}", e);
-                                            break;
+                if p.topic == topic
+                    && let Some(peer_addr_str) = self.decrypt_message(&p.payload)
+                {
+                    match peer_addr_str.parse::<SocketAddr>() {
+                        Ok(peer_socket_addr) => {
+                            info!("Client Address: {}", peer_socket_addr);
+                            // UDPでピアにメッセージを送信
+                            for _ in 0..5 {
+                                socket.send_to(b"PU", peer_socket_addr).unwrap();
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                            }
+                            // パンチングパケットの受信と破棄
+                            socket
+                                .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+                                .unwrap();
+                            let mut buf = [0; 10]; // 受信バッファ
+                            for _ in 0..5 {
+                                // 念のため複数回試行
+                                match socket.recv_from(&mut buf) {
+                                    Ok((amt, src)) => {
+                                        if &buf[..amt] == b"PU" {
+                                            info!("Received punching packet from {}", src);
+                                        } else {
+                                            info!(
+                                                "Received unexpected packet from {}: {:?}",
+                                                src,
+                                                &buf[..amt]
+                                            );
                                         }
                                     }
+                                    Err(ref e)
+                                        if e.kind() == std::io::ErrorKind::WouldBlock
+                                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                                    {
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        info!("Error receiving punching packet: {:?}", e);
+                                        break;
+                                    }
                                 }
-                                return Some(peer_socket_addr);
                             }
-                            Err(e) => {
-                                info!("Failed to parse peer address '{}': {}", peer_addr_str, e);
-                                return None;
-                            }
+                            return Some(peer_socket_addr);
+                        }
+                        Err(e) => {
+                            info!("Failed to parse peer address '{}': {}", peer_addr_str, e);
+                            return None;
                         }
                     }
-                } else {
+                } else if p.topic != topic {
                     info!("Invalid topic: {} != {}", p.topic, topic);
                 }
             } else {
