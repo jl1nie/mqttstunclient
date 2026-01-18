@@ -67,7 +67,7 @@ impl AddressCandidates {
     }
 
     /// Check if an address is in private IP range
-    fn is_private_ip(addr: &SocketAddr) -> bool {
+    pub(crate) fn is_private_ip(addr: &SocketAddr) -> bool {
         match addr.ip() {
             IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
             IpAddr::V6(ip) => {
@@ -763,7 +763,6 @@ impl MQTTStunClient {
         }
         None
     }
-
     #[cfg(feature = "esp-idf-mqtt")]
     pub fn get_client_addr(&mut self, socket: &UdpSocket) -> Option<SocketAddr> {
         use esp_idf_svc::mqtt::client::{EspMqttClient, MqttClientConfiguration, QoS};
@@ -915,5 +914,288 @@ impl MQTTStunClient {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ===================
+    // AddressCandidates tests
+    // ===================
+
+    #[test]
+    fn test_address_candidates_to_payload_both() {
+        let candidates = AddressCandidates {
+            local: Some("192.168.1.100:5000".parse().unwrap()),
+            stun: Some("203.0.113.50:5000".parse().unwrap()),
+        };
+        let payload = candidates.to_payload();
+        assert_eq!(payload, "203.0.113.50:5000,192.168.1.100:5000");
+    }
+
+    #[test]
+    fn test_address_candidates_to_payload_stun_only() {
+        let candidates = AddressCandidates {
+            local: None,
+            stun: Some("203.0.113.50:5000".parse().unwrap()),
+        };
+        let payload = candidates.to_payload();
+        assert_eq!(payload, "203.0.113.50:5000");
+    }
+
+    #[test]
+    fn test_address_candidates_to_payload_local_only() {
+        let candidates = AddressCandidates {
+            local: Some("192.168.1.100:5000".parse().unwrap()),
+            stun: None,
+        };
+        let payload = candidates.to_payload();
+        assert_eq!(payload, "192.168.1.100:5000");
+    }
+
+    #[test]
+    fn test_address_candidates_to_payload_empty() {
+        let candidates = AddressCandidates {
+            local: None,
+            stun: None,
+        };
+        let payload = candidates.to_payload();
+        assert_eq!(payload, "");
+    }
+
+    #[test]
+    fn test_address_candidates_from_payload_both() {
+        let candidates = AddressCandidates::from_payload("203.0.113.50:5000,192.168.1.100:5000");
+        assert_eq!(candidates.stun, Some("203.0.113.50:5000".parse().unwrap()));
+        assert_eq!(
+            candidates.local,
+            Some("192.168.1.100:5000".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn test_address_candidates_from_payload_public_only() {
+        // Public IP is detected as STUN
+        let candidates = AddressCandidates::from_payload("203.0.113.50:5000");
+        assert_eq!(candidates.stun, Some("203.0.113.50:5000".parse().unwrap()));
+        assert_eq!(candidates.local, None);
+    }
+
+    #[test]
+    fn test_address_candidates_from_payload_private_only() {
+        // Private IP is detected as local
+        let candidates = AddressCandidates::from_payload("192.168.1.100:5000");
+        assert_eq!(candidates.stun, None);
+        assert_eq!(
+            candidates.local,
+            Some("192.168.1.100:5000".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn test_address_candidates_from_payload_empty() {
+        let candidates = AddressCandidates::from_payload("");
+        assert_eq!(candidates.stun, None);
+        assert_eq!(candidates.local, None);
+    }
+
+    #[test]
+    fn test_address_candidates_roundtrip() {
+        let original = AddressCandidates {
+            local: Some("10.0.0.5:12345".parse().unwrap()),
+            stun: Some("198.51.100.1:54321".parse().unwrap()),
+        };
+        let payload = original.to_payload();
+        let parsed = AddressCandidates::from_payload(&payload);
+        assert_eq!(original.local, parsed.local);
+        assert_eq!(original.stun, parsed.stun);
+    }
+
+    #[test]
+    fn test_address_candidates_to_vec() {
+        let candidates = AddressCandidates {
+            local: Some("192.168.1.100:5000".parse().unwrap()),
+            stun: Some("203.0.113.50:5000".parse().unwrap()),
+        };
+        let vec = candidates.to_vec();
+        assert_eq!(vec.len(), 2);
+        // Local should come first (prioritized for same-LAN)
+        assert_eq!(vec[0], "192.168.1.100:5000".parse().unwrap());
+        assert_eq!(vec[1], "203.0.113.50:5000".parse().unwrap());
+    }
+
+    #[test]
+    fn test_address_candidates_is_private_ip() {
+        // Private ranges
+        assert!(AddressCandidates::is_private_ip(
+            &"192.168.1.1:1234".parse().unwrap()
+        ));
+        assert!(AddressCandidates::is_private_ip(
+            &"10.0.0.1:1234".parse().unwrap()
+        ));
+        assert!(AddressCandidates::is_private_ip(
+            &"172.16.0.1:1234".parse().unwrap()
+        ));
+        assert!(AddressCandidates::is_private_ip(
+            &"127.0.0.1:1234".parse().unwrap()
+        ));
+        // Link-local
+        assert!(AddressCandidates::is_private_ip(
+            &"169.254.1.1:1234".parse().unwrap()
+        ));
+        // Public
+        assert!(!AddressCandidates::is_private_ip(
+            &"8.8.8.8:1234".parse().unwrap()
+        ));
+        assert!(!AddressCandidates::is_private_ip(
+            &"203.0.113.1:1234".parse().unwrap()
+        ));
+    }
+
+    // ===================
+    // Encryption tests
+    // ===================
+
+    /// Helper to create a key from password (same logic as MQTTStunClient::new)
+    fn make_key(password: &str) -> [u8; 32] {
+        let key_bytes = password.as_bytes();
+        let mut key = [0u8; 32];
+        let len_to_copy = std::cmp::min(key_bytes.len(), key.len());
+        key[..len_to_copy].copy_from_slice(&key_bytes[..len_to_copy]);
+        key
+    }
+
+    /// Encrypt test helper
+    fn encrypt_with_key(key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
+        use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::Aead};
+        let cipher = ChaCha20Poly1305::new(key.into());
+        let mut iv = [0u8; 12];
+        rand::fill(&mut iv);
+        let ciphertext = cipher
+            .encrypt(&iv.into(), plaintext)
+            .expect("encryption failed");
+        [iv.to_vec(), ciphertext].concat()
+    }
+
+    /// Decrypt test helper
+    fn decrypt_with_key(key: &[u8; 32], encrypted: &[u8]) -> Option<String> {
+        use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::Aead};
+        if encrypted.len() < 12 {
+            return None;
+        }
+        let (iv, ciphertext) = encrypted.split_at(12);
+        let cipher = ChaCha20Poly1305::new(key.into());
+        let iv_array: [u8; 12] = iv.try_into().ok()?;
+        let decrypted = cipher.decrypt(&iv_array.into(), ciphertext).ok()?;
+        String::from_utf8(decrypted).ok()
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_roundtrip() {
+        let key = make_key("test_password");
+
+        let plaintext = "Hello, World!";
+        let encrypted = encrypt_with_key(&key, plaintext.as_bytes());
+        let decrypted = decrypt_with_key(&key, &encrypted);
+
+        assert!(decrypted.is_some());
+        assert_eq!(decrypted.unwrap(), plaintext);
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_empty() {
+        let key = make_key("test_password");
+
+        let plaintext = "";
+        let encrypted = encrypt_with_key(&key, plaintext.as_bytes());
+        let decrypted = decrypt_with_key(&key, &encrypted);
+
+        assert!(decrypted.is_some());
+        assert_eq!(decrypted.unwrap(), plaintext);
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_binary_data() {
+        let key = make_key("secret123");
+
+        // Binary data that's valid UTF-8 when decrypted
+        let plaintext = "192.168.1.100:5000,10.0.0.1:6000";
+        let encrypted = encrypt_with_key(&key, plaintext.as_bytes());
+        let decrypted = decrypt_with_key(&key, &encrypted);
+
+        assert!(decrypted.is_some());
+        assert_eq!(decrypted.unwrap(), plaintext);
+    }
+
+    #[test]
+    fn test_decrypt_invalid_data() {
+        let key = make_key("test_password");
+
+        // Random garbage that's not valid encrypted data
+        let garbage = vec![0u8, 1, 2, 3, 4, 5];
+        let decrypted = decrypt_with_key(&key, &garbage);
+
+        // Should fail to decrypt invalid data (too short for IV)
+        assert!(decrypted.is_none());
+    }
+
+    #[test]
+    fn test_decrypt_tampered_data() {
+        let key = make_key("test_password");
+
+        let plaintext = "secret message";
+        let mut encrypted = encrypt_with_key(&key, plaintext.as_bytes());
+        // Tamper with the ciphertext
+        if encrypted.len() > 15 {
+            encrypted[15] ^= 0xFF;
+        }
+        let decrypted = decrypt_with_key(&key, &encrypted);
+
+        // Should fail to decrypt tampered data
+        assert!(decrypted.is_none());
+    }
+
+    #[test]
+    fn test_different_passwords_cannot_decrypt() {
+        let key1 = make_key("password1");
+        let key2 = make_key("password2");
+
+        let plaintext = "secret message";
+        let encrypted = encrypt_with_key(&key1, plaintext.as_bytes());
+        let decrypted = decrypt_with_key(&key2, &encrypted);
+
+        // Different password should fail to decrypt
+        assert!(decrypted.is_none());
+    }
+
+    #[test]
+    fn test_same_password_can_decrypt() {
+        let key = make_key("shared_password");
+
+        let plaintext = "shared secret";
+        let encrypted = encrypt_with_key(&key, plaintext.as_bytes());
+        let decrypted = decrypt_with_key(&key, &encrypted);
+
+        // Same password should allow decryption
+        assert!(decrypted.is_some());
+        assert_eq!(decrypted.unwrap(), plaintext);
+    }
+
+    #[test]
+    fn test_long_password_truncated() {
+        // Password longer than 32 bytes should be truncated
+        let long_password = "this_is_a_very_long_password_that_exceeds_32_bytes";
+        let key = make_key(long_password);
+
+        // Only first 32 bytes should be used
+        assert_eq!(&key[..32], &long_password.as_bytes()[..32]);
+
+        // Encryption should still work
+        let plaintext = "test";
+        let encrypted = encrypt_with_key(&key, plaintext.as_bytes());
+        let decrypted = decrypt_with_key(&key, &encrypted);
+        assert_eq!(decrypted.unwrap(), plaintext);
     }
 }

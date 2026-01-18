@@ -8,7 +8,6 @@ fn main() {
         .init();
     let server_name = "jl1nie/wifikey2".to_string();
     let server_password = "wifikey2-server".to_string();
-    let sesami = 5663659633269137539;
     let mut server = MQTTStunClient::new(server_name, "wifikey2-server", None, None);
 
     let udp = UdpSocket::bind("0.0.0.0:0").unwrap();
@@ -23,7 +22,7 @@ fn main() {
     match listener.accept() {
         Ok((session, addr)) => {
             info!("Accept new session from {}", addr);
-            if let Ok(_magic) = challenge(session.clone(), &server_password, sesami) {
+            if let Ok(_magic) = challenge(session.clone(), &server_password) {
                 info!("Auth. success.");
             } else {
                 info!("Auth. failure.");
