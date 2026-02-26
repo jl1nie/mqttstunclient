@@ -52,6 +52,7 @@ pub struct AuthInfo {
 
 /// Result of a successful TURN Allocate
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct AllocateResult {
     pub relayed_addr: SocketAddr,
     pub mapped_addr: Option<SocketAddr>,
@@ -100,7 +101,7 @@ pub fn add_attr(buf: &mut Vec<u8>, attr_type: u16, value: &[u8]) {
     buf.extend_from_slice(&(value.len() as u16).to_be_bytes());
     buf.extend_from_slice(value);
     let pad = (4 - (value.len() % 4)) % 4;
-    buf.extend(std::iter::repeat(0u8).take(pad));
+    buf.extend(std::iter::repeat_n(0u8, pad));
 }
 
 /// Encode an IPv4 SocketAddr as an XOR-encoded address attribute value (8 bytes).
@@ -254,7 +255,11 @@ fn build_with_integrity(msg_type: u16, txid: &[u8; 12], attrs: Vec<u8>, key: &[u
 pub fn build_allocate_request(txid: &[u8; 12]) -> Vec<u8> {
     let mut attrs = Vec::new();
     // REQUESTED-TRANSPORT = 17 (UDP)
-    add_attr(&mut attrs, ATTR_REQUESTED_TRANSPORT, &[0x11, 0x00, 0x00, 0x00]);
+    add_attr(
+        &mut attrs,
+        ATTR_REQUESTED_TRANSPORT,
+        &[0x11, 0x00, 0x00, 0x00],
+    );
     let body_len = attrs.len() as u16;
     let mut msg = build_header(TURN_ALLOCATE_REQUEST, body_len, txid);
     msg.extend_from_slice(&attrs);
@@ -264,7 +269,11 @@ pub fn build_allocate_request(txid: &[u8; 12]) -> Vec<u8> {
 /// Build an authenticated Allocate Request.
 pub fn build_allocate_request_auth(txid: &[u8; 12], auth: &AuthInfo) -> Vec<u8> {
     let mut attrs = Vec::new();
-    add_attr(&mut attrs, ATTR_REQUESTED_TRANSPORT, &[0x11, 0x00, 0x00, 0x00]);
+    add_attr(
+        &mut attrs,
+        ATTR_REQUESTED_TRANSPORT,
+        &[0x11, 0x00, 0x00, 0x00],
+    );
     add_attr(&mut attrs, ATTR_USERNAME, auth.username.as_bytes());
     add_attr(&mut attrs, ATTR_REALM, auth.realm.as_bytes());
     add_attr(&mut attrs, ATTR_NONCE, auth.nonce.as_bytes());
@@ -318,9 +327,7 @@ pub fn parse_allocate_response(buf: &[u8]) -> Result<AllocateResult, TurnError> 
         match *attr_type {
             ATTR_XOR_RELAYED_ADDRESS => relayed_addr = decode_xor_addr(value),
             ATTR_XOR_MAPPED_ADDRESS => mapped_addr = decode_xor_addr(value),
-            ATTR_MAPPED_ADDRESS if mapped_addr.is_none() => {
-                mapped_addr = decode_raw_addr_v4(value)
-            }
+            ATTR_MAPPED_ADDRESS if mapped_addr.is_none() => mapped_addr = decode_raw_addr_v4(value),
             ATTR_LIFETIME if value.len() >= 4 => {
                 lifetime = u32::from_be_bytes([value[0], value[1], value[2], value[3]]);
             }

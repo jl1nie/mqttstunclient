@@ -236,7 +236,9 @@ impl MQTTStunClient {
             .unwrap_or("mqtt://broker.emqx.io:1883")
             .to_string();
 
-        info!("STUN Server: {stun_server_addr} MQTT Topic: {server_name} Broker: {mqtt_broker_url}");
+        info!(
+            "STUN Server: {stun_server_addr} MQTT Topic: {server_name} Broker: {mqtt_broker_url}"
+        );
 
         Self {
             server_name,
@@ -528,17 +530,17 @@ impl MQTTStunClient {
         match get_if_addrs() {
             Ok(addrs) => {
                 for iface in addrs {
-                    if let IpAddr::V6(v6) = iface.ip() {
-                        if !v6.is_loopback()
-                            && !v6.is_multicast()
-                            && !v6.is_unspecified()
-                            && (v6.segments()[0] & 0xfe00) != 0xfc00 // not ULA
-                            && (v6.segments()[0] & 0xffc0) != 0xfe80 // not link-local
-                        {
-                            let addr = SocketAddr::new(IpAddr::V6(v6), port);
-                            info!("Local IPv6 Address: {addr}");
-                            return Some(addr);
-                        }
+                    if let IpAddr::V6(v6) = iface.ip()
+                        && !v6.is_loopback()
+                        && !v6.is_multicast()
+                        && !v6.is_unspecified()
+                        && (v6.segments()[0] & 0xfe00) != 0xfc00 // not ULA
+                        && (v6.segments()[0] & 0xffc0) != 0xfe80
+                    // not link-local
+                    {
+                        let addr = SocketAddr::new(IpAddr::V6(v6), port);
+                        info!("Local IPv6 Address: {addr}");
+                        return Some(addr);
                     }
                 }
                 info!("No global IPv6 address found");
@@ -567,7 +569,8 @@ impl MQTTStunClient {
                 && !v6.is_multicast()
                 && !v6.is_unspecified()
                 && (v6.segments()[0] & 0xfe00) != 0xfc00 // not ULA
-                && (v6.segments()[0] & 0xffc0) != 0xfe80 // not link-local
+                && (v6.segments()[0] & 0xffc0) != 0xfe80
+            // not link-local
             {
                 let addr = SocketAddr::new(IpAddr::V6(v6), port);
                 info!("Local IPv6 Address (ESP32): {addr}");
@@ -623,10 +626,10 @@ impl MQTTStunClient {
     /// addresses.  This helper converts them back so that address comparisons
     /// with plain IPv4 candidates work correctly.
     fn normalize_addr(addr: SocketAddr) -> SocketAddr {
-        if let SocketAddr::V6(v6) = addr {
-            if let Some(v4) = v6.ip().to_ipv4_mapped() {
-                return SocketAddr::new(IpAddr::V4(v4), v6.port());
-            }
+        if let SocketAddr::V6(v6) = addr
+            && let Some(v4) = v6.ip().to_ipv4_mapped()
+        {
+            return SocketAddr::new(IpAddr::V4(v4), v6.port());
         }
         addr
     }
@@ -1258,7 +1261,11 @@ mod tests {
         let candidates = AddressCandidates {
             local: Some("192.168.1.10:5000".parse().unwrap()),
             stun: Some("1.2.3.4:5000".parse().unwrap()),
-            turn: Some("relay.example.com:49152".parse::<SocketAddr>().unwrap_or_else(|_| "5.6.7.8:49152".parse().unwrap())),
+            turn: Some(
+                "relay.example.com:49152"
+                    .parse::<SocketAddr>()
+                    .unwrap_or_else(|_| "5.6.7.8:49152".parse().unwrap()),
+            ),
             local_v6: None,
         };
         let payload = candidates.to_payload();
@@ -1283,7 +1290,8 @@ mod tests {
     #[test]
     fn test_address_candidates_from_payload_kv_both() {
         // New key=value format
-        let candidates = AddressCandidates::from_payload("local=192.168.1.100:5000,stun=203.0.113.50:5000");
+        let candidates =
+            AddressCandidates::from_payload("local=192.168.1.100:5000,stun=203.0.113.50:5000");
         assert_eq!(candidates.stun, Some("203.0.113.50:5000".parse().unwrap()));
         assert_eq!(
             candidates.local,
