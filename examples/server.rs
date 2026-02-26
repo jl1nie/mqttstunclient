@@ -8,16 +8,26 @@ fn main() {
         .init();
     let server_name = "jl1nie/wifikey2".to_string();
     let server_password = "wifikey2-server".to_string();
-    let mut server = MQTTStunClient::new(server_name, "wifikey2-server", None, None);
+    let mut server = MQTTStunClient::new(server_name, "wifikey2-server", None, None, None);
 
     let udp = UdpSocket::bind("0.0.0.0:0").unwrap();
-    if let Some(client_addr) = server.get_client_addr(&udp) {
+    let mut conn_result = server.get_client_addr(&udp);
+    if let Some(ref r) = conn_result {
         println!(
             "\nよっしゃ！クライアントのアドレス {} をゲットだぜ！✨",
-            client_addr
+            r.peer_addr
         );
     }
-    let mut listener = WkListener::bind(udp).unwrap();
+    let listener_socket = if let Some(ref mut r) = conn_result {
+        if let Some(ref mut proxy) = r.turn_proxy {
+            proxy.take_app_socket().expect("app_socket already taken")
+        } else {
+            udp
+        }
+    } else {
+        udp
+    };
+    let mut listener = WkListener::bind(listener_socket).unwrap();
     println!("クライアントからのメッセージ、待機中…ワクワク！🤩");
     match listener.accept() {
         Ok((session, addr)) => {

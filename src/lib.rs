@@ -4,91 +4,196 @@ use log::info;
 use std::convert::TryInto;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 
-/// ICE-like address candidates for NAT traversal
-/// Contains both local (host) and STUN-acquired (server reflexive) addresses
+#[cfg(feature = "ru-mqtt")]
+mod turn;
+#[cfg(feature = "ru-mqtt")]
+mod turnproxy;
+#[cfg(feature = "ru-mqtt")]
+pub use turnproxy::TurnProxy;
+
+/// ICE-like address candidates for NAT traversal.
+///
+/// Candidates are ordered by priority in `to_vec()`:
+/// `local_v6` → `local` → `stun` → `turn`
 #[derive(Debug, Clone)]
 pub struct AddressCandidates {
-    /// Local/private IP address (host candidate)
+    /// Local/private IPv4 address (host candidate)
     pub local: Option<SocketAddr>,
-    /// STUN-acquired public IP address (server reflexive candidate)
+    /// STUN-acquired public IPv4 address (server-reflexive candidate)
     pub stun: Option<SocketAddr>,
+    /// TURN relay address (relayed candidate — lowest priority, fallback)
+    pub turn: Option<SocketAddr>,
+    /// Local IPv6 global-unicast address (host candidate, NATless)
+    pub local_v6: Option<SocketAddr>,
 }
 
 impl AddressCandidates {
-    /// Create new candidates with both addresses
+    /// Create candidates with local and STUN addresses (turn/local_v6 default to None).
     pub fn new(local: Option<SocketAddr>, stun: Option<SocketAddr>) -> Self {
-        Self { local, stun }
-    }
-
-    /// Serialize to MQTT payload format: "stun_addr,local_addr" or "stun_addr" or "local_addr"
-    pub fn to_payload(&self) -> String {
-        match (&self.stun, &self.local) {
-            (Some(stun), Some(local)) => format!("{stun},{local}"),
-            (Some(stun), None) => format!("{stun}"),
-            (None, Some(local)) => format!("{local}"),
-            (None, None) => String::new(),
+        Self {
+            local,
+            stun,
+            turn: None,
+            local_v6: None,
         }
     }
 
-    /// Parse from MQTT payload format
+    /// Serialize to MQTT payload in key=value format.
+    ///
+    /// Example: `"local=192.168.1.10:5000,stun=1.2.3.4:5000,turn=relay:49152,v6=[::1]:5000"`
+    pub fn to_payload(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(local) = self.local {
+            parts.push(format!("local={local}"));
+        }
+        if let Some(stun) = self.stun {
+            parts.push(format!("stun={stun}"));
+        }
+        if let Some(turn) = self.turn {
+            parts.push(format!("turn={turn}"));
+        }
+        if let Some(v6) = self.local_v6 {
+            parts.push(format!("v6={v6}"));
+        }
+        parts.join(",")
+    }
+
+    /// Parse from MQTT payload.
+    ///
+    /// Handles both the new key=value format and the legacy `"stun_addr,local_addr"` format
+    /// for backward compatibility with older firmware.
     pub fn from_payload(payload: &str) -> Self {
+        if payload.is_empty() {
+            return Self::new(None, None);
+        }
+
+        // Detect format: new format contains '=' in the first field
+        if payload.contains('=') {
+            Self::parse_kv_format(payload)
+        } else {
+            Self::parse_legacy_format(payload)
+        }
+    }
+
+    /// Parse the new key=value format.
+    fn parse_kv_format(payload: &str) -> Self {
+        let mut local = None;
+        let mut stun = None;
+        let mut turn = None;
+        let mut local_v6 = None;
+
+        // Split on ',' but be careful about IPv6 addresses like "[::1]:5000"
+        // Since IPv6 addresses use brackets, a simple comma-split is safe
+        // (brackets don't contain commas).
+        for part in payload.split(',') {
+            let part = part.trim();
+            if let Some((key, val)) = part.split_once('=') {
+                match key {
+                    "local" => local = val.parse().ok(),
+                    "stun" => stun = val.parse().ok(),
+                    "turn" => turn = val.parse().ok(),
+                    "v6" => local_v6 = val.parse().ok(),
+                    _ => {}
+                }
+            }
+        }
+        Self {
+            local,
+            stun,
+            turn,
+            local_v6,
+        }
+    }
+
+    /// Parse the legacy `"stun_addr,local_addr"` format for backward compatibility.
+    fn parse_legacy_format(payload: &str) -> Self {
         let parts: Vec<&str> = payload.split(',').collect();
         match parts.as_slice() {
-            [stun, local] => Self {
-                stun: stun.parse().ok(),
-                local: local.parse().ok(),
+            [first, second] => Self {
+                stun: first.parse().ok(),
+                local: second.parse().ok(),
+                turn: None,
+                local_v6: None,
             },
             [single] => {
-                // Try to determine if it's local or STUN based on IP range
                 if let Ok(addr) = single.parse::<SocketAddr>() {
                     if Self::is_private_ip(&addr) {
                         Self {
                             local: Some(addr),
                             stun: None,
+                            turn: None,
+                            local_v6: None,
                         }
                     } else {
                         Self {
                             stun: Some(addr),
                             local: None,
+                            turn: None,
+                            local_v6: None,
                         }
                     }
                 } else {
-                    Self {
-                        local: None,
-                        stun: None,
-                    }
+                    Self::new(None, None)
                 }
             }
-            _ => Self {
-                local: None,
-                stun: None,
-            },
+            _ => Self::new(None, None),
         }
     }
 
-    /// Check if an address is in private IP range
+    /// Check if an address is in a private/non-routable IP range.
     pub(crate) fn is_private_ip(addr: &SocketAddr) -> bool {
         match addr.ip() {
             IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
-            IpAddr::V6(ip) => {
-                ip.is_loopback() // IPv6 private detection is more complex
-            }
+            IpAddr::V6(ip) => ip.is_loopback(),
         }
     }
 
-    /// Get all valid addresses as a vector, prioritizing local for same-LAN
+    /// Return all valid candidates as a vector in priority order:
+    /// `local_v6` → `local` → `stun` → `turn`
+    ///
+    /// The TURN relay candidate is last (lowest priority / fallback).
     pub fn to_vec(&self) -> Vec<SocketAddr> {
         let mut addrs = Vec::new();
-        // Try local first (faster if on same LAN)
+        if let Some(v6) = self.local_v6 {
+            addrs.push(v6);
+        }
         if let Some(local) = self.local {
             addrs.push(local);
         }
-        // Then STUN address
         if let Some(stun) = self.stun {
             addrs.push(stun);
         }
+        if let Some(turn) = self.turn {
+            addrs.push(turn);
+        }
         addrs
     }
+}
+
+/// TURN server configuration (optional).
+///
+/// When set on [`MQTTStunClient`], a TURN relay will be allocated and its
+/// address included as a fallback candidate.  If unset, only STUN+hole-punch
+/// is used (the existing behaviour).
+#[cfg(feature = "ru-mqtt")]
+#[derive(Clone)]
+pub struct TurnConfig {
+    /// TURN server address, e.g. `"turn.example.com:3478".parse().unwrap()`
+    pub server: SocketAddr,
+    /// TURN username
+    pub username: String,
+    /// TURN password
+    pub password: String,
+}
+
+/// Result returned by [`MQTTStunClient::get_client_addr`].
+pub struct ConnectionResult {
+    /// The effective peer address (hole-punched or TURN relay address).
+    pub peer_addr: SocketAddr,
+    /// TURN proxy, present only when the relay path is being used.
+    /// Must be kept alive as long as the session is active.
+    #[cfg(feature = "ru-mqtt")]
+    pub turn_proxy: Option<TurnProxy>,
 }
 
 pub struct MQTTStunClient {
@@ -96,6 +201,9 @@ pub struct MQTTStunClient {
     key: [u8; 32],
     stun_server_addr: SocketAddr,
     mqtt_broker_url: String,
+    /// TURN server configuration (optional, `ru-mqtt` feature only).
+    #[cfg(feature = "ru-mqtt")]
+    turn_config: Option<TurnConfig>,
 }
 
 impl MQTTStunClient {
@@ -109,31 +217,34 @@ impl MQTTStunClient {
         key: &str,
         stun_server: Option<&str>,
         mqtt_broker_url: Option<&str>,
+        #[cfg(feature = "ru-mqtt")] turn_config: Option<TurnConfig>,
     ) -> Self {
         let key_bytes = key.as_bytes();
         let mut key = [0u8; 32];
         let len_to_copy = std::cmp::min(key_bytes.len(), key.len());
         key[..len_to_copy].copy_from_slice(&key_bytes[..len_to_copy]);
 
-        //stun_server_addrを指定しない場合は、GoogleのSTUNサーバーを使用
+        // Default STUN server: Google's public STUN
         let stun_server_addr = stun_server
             .unwrap_or("stun.l.google.com:19302")
             .to_socket_addrs()
             .ok()
-            .and_then(|mut iter| iter.find(|addr| addr.is_ipv4())) // IPv4アドレスだけフィルタリング！
-            .expect("STUN server IPv4 address not found."); // 見つからなかったらパニック！
+            .and_then(|mut iter| iter.find(|addr| addr.is_ipv4()))
+            .expect("STUN server IPv4 address not found.");
 
         let mqtt_broker_url = mqtt_broker_url
             .unwrap_or("mqtt://broker.emqx.io:1883")
             .to_string();
 
-        info!("STUN Sever: {stun_server_addr} MQTT Topic: {server_name} Broker: {mqtt_broker_url}");
+        info!("STUN Server: {stun_server_addr} MQTT Topic: {server_name} Broker: {mqtt_broker_url}");
 
         Self {
             server_name,
             key,
             stun_server_addr,
             mqtt_broker_url,
+            #[cfg(feature = "ru-mqtt")]
+            turn_config,
         }
     }
 
@@ -403,14 +514,94 @@ impl MQTTStunClient {
         }
     }
 
-    /// Get both local and STUN addresses as candidates
+    /// Get the first global-unicast IPv6 address of the local machine.
+    ///
+    /// Excludes loopback, link-local (fe80::/10), ULA (fc00::/7), and multicast.
+    /// Returns `None` if no global IPv6 address is found or IPv6 is unavailable.
+    ///
+    /// `ru-mqtt` build: enumerates interfaces with `if_addrs` to find all addresses.
+    /// `esp-idf-mqtt` build: uses the "connect trick" (route lookup, no packet sent)
+    ///   which also works on ESP32/lwIP.
+    #[cfg(feature = "ru-mqtt")]
+    fn get_local_v6_addr(port: u16) -> Option<SocketAddr> {
+        use if_addrs::get_if_addrs;
+        match get_if_addrs() {
+            Ok(addrs) => {
+                for iface in addrs {
+                    if let IpAddr::V6(v6) = iface.ip() {
+                        if !v6.is_loopback()
+                            && !v6.is_multicast()
+                            && !v6.is_unspecified()
+                            && (v6.segments()[0] & 0xfe00) != 0xfc00 // not ULA
+                            && (v6.segments()[0] & 0xffc0) != 0xfe80 // not link-local
+                        {
+                            let addr = SocketAddr::new(IpAddr::V6(v6), port);
+                            info!("Local IPv6 Address: {addr}");
+                            return Some(addr);
+                        }
+                    }
+                }
+                info!("No global IPv6 address found");
+                None
+            }
+            Err(e) => {
+                info!("Failed to enumerate network interfaces: {e}");
+                None
+            }
+        }
+    }
+
+    /// IPv6 address discovery for ESP32 (esp-idf-mqtt).
+    ///
+    /// Uses UDP "connect" trick: set the routing destination without sending data,
+    /// then read back the local address that lwIP selected.  Works even if Google
+    /// DNS is not reachable because no packet is actually sent.
+    #[cfg(all(feature = "esp-idf-mqtt", not(feature = "ru-mqtt")))]
+    fn get_local_v6_addr(port: u16) -> Option<SocketAddr> {
+        // Google Public DNS (IPv6) — used only as a routing target, no packet sent.
+        let temp = UdpSocket::bind("[::]:0").ok()?;
+        temp.connect("[2001:4860:4860::8888]:53").ok()?;
+        let local = temp.local_addr().ok()?;
+        if let IpAddr::V6(v6) = local.ip() {
+            if !v6.is_loopback()
+                && !v6.is_multicast()
+                && !v6.is_unspecified()
+                && (v6.segments()[0] & 0xfe00) != 0xfc00 // not ULA
+                && (v6.segments()[0] & 0xffc0) != 0xfe80 // not link-local
+            {
+                let addr = SocketAddr::new(IpAddr::V6(v6), port);
+                info!("Local IPv6 Address (ESP32): {addr}");
+                return Some(addr);
+            }
+        }
+        info!("No global IPv6 address on ESP32");
+        None
+    }
+
+    /// Get address candidates: local IPv4, STUN server-reflexive, and local IPv6.
     fn get_address_candidates(&mut self, socket: &UdpSocket) -> AddressCandidates {
         let local_addr = Self::get_local_addr(socket);
         let stun_addr = self.get_stun_addr(socket);
 
-        info!("Address Candidates - Local: {local_addr:?}, STUN: {stun_addr:?}");
+        // IPv6 discovery is available for both ru-mqtt and esp-idf-mqtt builds.
+        #[cfg(any(feature = "ru-mqtt", feature = "esp-idf-mqtt"))]
+        let local_v6 = {
+            let port = socket.local_addr().ok().map(|a| a.port()).unwrap_or(0);
+            Self::get_local_v6_addr(port)
+        };
+        #[cfg(not(any(feature = "ru-mqtt", feature = "esp-idf-mqtt")))]
+        let local_v6: Option<SocketAddr> = None;
 
-        AddressCandidates::new(local_addr, stun_addr)
+        info!(
+            "Address Candidates - Local: {local_addr:?}, STUN: {stun_addr:?}, IPv6: {local_v6:?}"
+        );
+
+        AddressCandidates {
+            local: local_addr,
+            stun: stun_addr,
+            local_v6,
+            turn: None,
+        }
     }
 
     /// Get encrypted payload containing address candidates
@@ -424,6 +615,20 @@ impl MQTTStunClient {
 
         info!("Address payload: {message}");
         self.encrypt_message(message.as_bytes())
+    }
+
+    /// Normalize IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) to pure IPv4.
+    ///
+    /// Dual-stack sockets on Linux return IPv4 connections as IPv4-mapped IPv6
+    /// addresses.  This helper converts them back so that address comparisons
+    /// with plain IPv4 candidates work correctly.
+    fn normalize_addr(addr: SocketAddr) -> SocketAddr {
+        if let SocketAddr::V6(v6) = addr {
+            if let Some(v4) = v6.ip().to_ipv4_mapped() {
+                return SocketAddr::new(IpAddr::V4(v4), v6.port());
+            }
+        }
+        addr
     }
 
     /// Try UDP hole punching to multiple candidate addresses and return the first one that responds
@@ -464,6 +669,8 @@ impl MQTTStunClient {
         for _ in 0..10 {
             match socket.recv_from(&mut buf) {
                 Ok((amt, src)) => {
+                    // Normalize IPv4-mapped IPv6 (::ffff:x.x.x.x) from dual-stack sockets.
+                    let src = Self::normalize_addr(src);
                     if &buf[..amt] == b"PU" {
                         info!("Received punch response from {src}");
                         // Check if the source is one of our candidates
@@ -563,7 +770,8 @@ impl MQTTStunClient {
     }
 
     #[cfg(feature = "rumqttc")]
-    pub fn get_client_addr(&mut self, socket: &UdpSocket) -> Option<SocketAddr> {
+    pub fn get_client_addr(&mut self, socket: &UdpSocket) -> Option<ConnectionResult> {
+        use crate::turnproxy::TurnProxy;
         use rumqttc::{Client, Event, MqttOptions, Packet, QoS};
 
         let host = self
@@ -589,8 +797,39 @@ impl MQTTStunClient {
         let mqttoptions = MqttOptions::new("wifikey-server", host, port);
         let (client, mut connection) = Client::new(mqttoptions, 10);
 
-        // Send our address candidates (both local and STUN)
-        let server_addr_payload = self.get_address_payload(socket);
+        // Build enhanced address candidates: local IPv4 + STUN + IPv6 + TURN relay
+        let local_addr = Self::get_local_addr(socket);
+        let stun_addr = self.get_stun_addr(socket);
+        let udp_port = socket.local_addr().ok().map(|a| a.port()).unwrap_or(0);
+        let v6_addr = Self::get_local_v6_addr(udp_port);
+
+        // Allocate TURN relay if configured (relay address is published as a candidate)
+        let mut turn_proxy_opt: Option<TurnProxy> = None;
+        if let Some(ref tc) = self.turn_config {
+            match TurnProxy::allocate(tc.server, &tc.username, &tc.password) {
+                Ok(proxy) => {
+                    info!("TURN relay allocated: {}", proxy.relayed_addr);
+                    turn_proxy_opt = Some(proxy);
+                }
+                Err(e) => info!("TURN allocation failed: {e} (continuing without TURN)"),
+            }
+        }
+
+        let candidates = AddressCandidates {
+            local: local_addr,
+            stun: stun_addr,
+            turn: turn_proxy_opt.as_ref().map(|p| p.relayed_addr),
+            local_v6: v6_addr,
+        };
+
+        let message = candidates.to_payload();
+        if message.is_empty() {
+            info!("No address candidates available");
+            return None;
+        }
+        info!("Server address candidates: {message}");
+        let server_addr_payload = self.encrypt_message(message.as_bytes());
+
         let stopic = format!("{}{}", self.server_name, "/server");
         client
             .publish(stopic.clone(), QoS::AtLeastOnce, true, server_addr_payload)
@@ -609,20 +848,57 @@ impl MQTTStunClient {
                     && !p.payload.is_empty()
                     && let Some(peer_addr_str) = self.decrypt_message(&p.payload)
                 {
-                    // Parse as address candidates
-                    let candidates = AddressCandidates::from_payload(&peer_addr_str);
-                    info!("Received client candidates: {:?}", candidates);
+                    // Parse client's address candidates
+                    let client_candidates = AddressCandidates::from_payload(&peer_addr_str);
+                    info!("Received client candidates: {:?}", client_candidates);
 
-                    if let Some(connected_addr) = Self::try_punch_candidates(socket, &candidates) {
-                        return Some(connected_addr);
-                    } else {
-                        info!("Failed to connect to any client candidate");
-                        return None;
+                    // Create TURN permission for the client's public IP before punching.
+                    // We use the STUN address (NAT-mapped) as the permitted peer IP.
+                    if let Some(ref proxy) = turn_proxy_opt {
+                        let client_ip = client_candidates
+                            .stun
+                            .or(client_candidates.local)
+                            .map(|a| a.ip());
+                        if let Some(ip) = client_ip {
+                            use std::net::SocketAddr;
+                            // TURN permission only cares about the IP; port is ignored.
+                            let peer_for_perm = SocketAddr::new(ip, 3478);
+                            if let Err(e) = proxy.create_permission(peer_for_perm) {
+                                info!("TURN CreatePermission failed: {e} (continuing)");
+                            }
+                        }
                     }
-                }
-            } else if let Some(Ok(Event::Incoming(Packet::Publish(p)))) = &notification {
-                if p.topic != topic {
-                    info!("Invalid topic: {} != {}", p.topic, topic);
+
+                    // Try direct hole punch (exclude TURN relay from punch targets)
+                    let direct = AddressCandidates {
+                        local: client_candidates.local,
+                        stun: client_candidates.stun,
+                        local_v6: client_candidates.local_v6,
+                        turn: None,
+                    };
+
+                    if let Some(connected_addr) = Self::try_punch_candidates(socket, &direct) {
+                        info!("Direct connection established: {connected_addr}");
+                        // TurnProxy (if any) is dropped here — relay threads are stopped.
+                        return Some(ConnectionResult {
+                            peer_addr: connected_addr,
+                            turn_proxy: None,
+                        });
+                    }
+
+                    // Direct punch failed — fall back to TURN relay if available
+                    if let Some(mut proxy) = turn_proxy_opt {
+                        info!("Direct punch failed, switching to TURN relay");
+                        proxy.start_threads();
+                        let relay_addr = proxy.relayed_addr;
+                        return Some(ConnectionResult {
+                            peer_addr: relay_addr,
+                            turn_proxy: Some(proxy),
+                        });
+                    }
+
+                    info!("Failed to connect to any client candidate");
+                    return None;
                 }
             } else {
                 info!("MQTT event: {:?}", notification);
@@ -764,7 +1040,7 @@ impl MQTTStunClient {
         None
     }
     #[cfg(feature = "esp-idf-mqtt")]
-    pub fn get_client_addr(&mut self, socket: &UdpSocket) -> Option<SocketAddr> {
+    pub fn get_client_addr(&mut self, socket: &UdpSocket) -> Option<ConnectionResult> {
         use esp_idf_svc::mqtt::client::{EspMqttClient, MqttClientConfiguration, QoS};
         use std::sync::mpsc;
         use std::thread;
@@ -907,7 +1183,11 @@ impl MQTTStunClient {
             // Try punching to all candidate addresses
             if let Some(connected_addr) = Self::try_punch_candidates(socket, &candidates) {
                 info!("クライアントへのパンチング成功！接続先: {connected_addr} (get_client_addr)");
-                return Some(connected_addr);
+                return Some(ConnectionResult {
+                    peer_addr: connected_addr,
+                    #[cfg(feature = "ru-mqtt")]
+                    turn_proxy: None,
+                });
             } else {
                 info!("全候補へのパンチング失敗… (get_client_addr)");
                 return None;
@@ -930,9 +1210,11 @@ mod tests {
         let candidates = AddressCandidates {
             local: Some("192.168.1.100:5000".parse().unwrap()),
             stun: Some("203.0.113.50:5000".parse().unwrap()),
+            turn: None,
+            local_v6: None,
         };
         let payload = candidates.to_payload();
-        assert_eq!(payload, "203.0.113.50:5000,192.168.1.100:5000");
+        assert_eq!(payload, "local=192.168.1.100:5000,stun=203.0.113.50:5000");
     }
 
     #[test]
@@ -940,9 +1222,11 @@ mod tests {
         let candidates = AddressCandidates {
             local: None,
             stun: Some("203.0.113.50:5000".parse().unwrap()),
+            turn: None,
+            local_v6: None,
         };
         let payload = candidates.to_payload();
-        assert_eq!(payload, "203.0.113.50:5000");
+        assert_eq!(payload, "stun=203.0.113.50:5000");
     }
 
     #[test]
@@ -950,9 +1234,11 @@ mod tests {
         let candidates = AddressCandidates {
             local: Some("192.168.1.100:5000".parse().unwrap()),
             stun: None,
+            turn: None,
+            local_v6: None,
         };
         let payload = candidates.to_payload();
-        assert_eq!(payload, "192.168.1.100:5000");
+        assert_eq!(payload, "local=192.168.1.100:5000");
     }
 
     #[test]
@@ -960,24 +1246,66 @@ mod tests {
         let candidates = AddressCandidates {
             local: None,
             stun: None,
+            turn: None,
+            local_v6: None,
         };
         let payload = candidates.to_payload();
         assert_eq!(payload, "");
     }
 
     #[test]
-    fn test_address_candidates_from_payload_both() {
+    fn test_address_candidates_to_payload_all() {
+        let candidates = AddressCandidates {
+            local: Some("192.168.1.10:5000".parse().unwrap()),
+            stun: Some("1.2.3.4:5000".parse().unwrap()),
+            turn: Some("relay.example.com:49152".parse::<SocketAddr>().unwrap_or_else(|_| "5.6.7.8:49152".parse().unwrap())),
+            local_v6: None,
+        };
+        let payload = candidates.to_payload();
+        assert!(payload.contains("local=192.168.1.10:5000"));
+        assert!(payload.contains("stun=1.2.3.4:5000"));
+        assert!(payload.contains("turn="));
+    }
+
+    #[test]
+    fn test_address_candidates_from_payload_legacy_both() {
+        // Legacy format: "stun_addr,local_addr"
         let candidates = AddressCandidates::from_payload("203.0.113.50:5000,192.168.1.100:5000");
         assert_eq!(candidates.stun, Some("203.0.113.50:5000".parse().unwrap()));
         assert_eq!(
             candidates.local,
             Some("192.168.1.100:5000".parse().unwrap())
         );
+        assert_eq!(candidates.turn, None);
+        assert_eq!(candidates.local_v6, None);
+    }
+
+    #[test]
+    fn test_address_candidates_from_payload_kv_both() {
+        // New key=value format
+        let candidates = AddressCandidates::from_payload("local=192.168.1.100:5000,stun=203.0.113.50:5000");
+        assert_eq!(candidates.stun, Some("203.0.113.50:5000".parse().unwrap()));
+        assert_eq!(
+            candidates.local,
+            Some("192.168.1.100:5000".parse().unwrap())
+        );
+        assert_eq!(candidates.turn, None);
+    }
+
+    #[test]
+    fn test_address_candidates_from_payload_kv_with_turn() {
+        let candidates = AddressCandidates::from_payload(
+            "local=192.168.1.10:5000,stun=1.2.3.4:5000,turn=5.6.7.8:49152",
+        );
+        assert_eq!(candidates.local, Some("192.168.1.10:5000".parse().unwrap()));
+        assert_eq!(candidates.stun, Some("1.2.3.4:5000".parse().unwrap()));
+        assert_eq!(candidates.turn, Some("5.6.7.8:49152".parse().unwrap()));
+        assert_eq!(candidates.local_v6, None);
     }
 
     #[test]
     fn test_address_candidates_from_payload_public_only() {
-        // Public IP is detected as STUN
+        // Public IP is detected as STUN in legacy format
         let candidates = AddressCandidates::from_payload("203.0.113.50:5000");
         assert_eq!(candidates.stun, Some("203.0.113.50:5000".parse().unwrap()));
         assert_eq!(candidates.local, None);
@@ -985,7 +1313,7 @@ mod tests {
 
     #[test]
     fn test_address_candidates_from_payload_private_only() {
-        // Private IP is detected as local
+        // Private IP is detected as local in legacy format
         let candidates = AddressCandidates::from_payload("192.168.1.100:5000");
         assert_eq!(candidates.stun, None);
         assert_eq!(
@@ -1002,15 +1330,18 @@ mod tests {
     }
 
     #[test]
-    fn test_address_candidates_roundtrip() {
+    fn test_address_candidates_roundtrip_new_format() {
         let original = AddressCandidates {
             local: Some("10.0.0.5:12345".parse().unwrap()),
             stun: Some("198.51.100.1:54321".parse().unwrap()),
+            turn: Some("5.6.7.8:49152".parse().unwrap()),
+            local_v6: None,
         };
         let payload = original.to_payload();
         let parsed = AddressCandidates::from_payload(&payload);
         assert_eq!(original.local, parsed.local);
         assert_eq!(original.stun, parsed.stun);
+        assert_eq!(original.turn, parsed.turn);
     }
 
     #[test]
@@ -1018,10 +1349,12 @@ mod tests {
         let candidates = AddressCandidates {
             local: Some("192.168.1.100:5000".parse().unwrap()),
             stun: Some("203.0.113.50:5000".parse().unwrap()),
+            turn: None,
+            local_v6: None,
         };
         let vec = candidates.to_vec();
         assert_eq!(vec.len(), 2);
-        // Local should come first (prioritized for same-LAN)
+        // Local should come first (same-LAN priority)
         assert_eq!(vec[0], "192.168.1.100:5000".parse().unwrap());
         assert_eq!(vec[1], "203.0.113.50:5000".parse().unwrap());
     }

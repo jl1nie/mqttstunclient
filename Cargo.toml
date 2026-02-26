@@ -16,11 +16,11 @@ opt-level = "z"
 default = ["ru-mqtt"]
 native = ["esp-idf-sys/native"]
 esp-idf-mqtt = ["esp-idf-svc", "esp-idf-hal", "esp-idf-sys"]
-ru-mqtt = ["rumqttc", "env_logger"]
+ru-mqtt = ["rumqttc", "env_logger", "hmac", "sha1", "md-5", "if-addrs", "anyhow"]
 
 [dependencies]
 chacha20poly1305 = "0.10"                           # ChaCha20暗号化
-rumqttc = { version = "0.24", optional = true }                  
+rumqttc = { version = "0.24", optional = true }
 log = { version = "0.4", default-features = false }
 rand = { version = "0.9.1", features = ["std"] }
 env_logger = { version = "0.11.8", optional = true }
@@ -28,6 +28,13 @@ esp-idf-sys = { version = "0.36", features = ["binstart"], optional = true }
 esp-idf-svc = { version = "0.51", features = ["experimental"], optional = true }
 esp-idf-hal = { version = "0.45.2", optional = true }
 wksocket = { path = "../wksocket" }
+
+# TURN protocol dependencies (ru-mqtt feature only)
+hmac = { version = "0.12", optional = true }
+sha1 = { version = "0.10", optional = true }
+md-5 = { version = "0.10", optional = true }
+if-addrs = { version = "0.7", optional = true }
+anyhow = { version = "1", optional = true }
 
 [build-dependencies]
 embuild = "0.33"

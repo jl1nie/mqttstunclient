@@ -3,7 +3,7 @@ use std::net::UdpSocket;
 fn main() {
     println!("クライアント起動！サーバーに愛を届けるぞー！💖");
     let server_name = "jl1nie/wifikey2".to_string(); // トピック名はサーバーと合わせないとね！
-    let mut client_logic = MQTTStunClient::new(server_name, "wifykey2-server", None, None); // 変数名変えた！
+    let mut client_logic = MQTTStunClient::new(server_name, "wifykey2-server", None, None, None); // 変数名変えた！
 
     // ポート番号は0にしてOSにおまかせ！その方がNAT越えしやすいってウワサも…？
     let udp_socket = match UdpSocket::bind("0.0.0.0:0") {
