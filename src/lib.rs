@@ -294,18 +294,37 @@ impl MQTTStunClient {
 
     /// link-local・ループバック・未指定を除いたルーティング可能なIPv6アドレスを取得する
     pub fn try_get_routable_ipv6() -> Option<IpAddr> {
-        let s = UdpSocket::bind("[::]:0").ok()?;
+        let s = match UdpSocket::bind("[::]:0") {
+            Ok(s) => s,
+            Err(e) => {
+                info!("try_get_routable_ipv6: bind [::]:0 失敗: {}", e);
+                return None;
+            }
+        };
         // Google IPv6 DNSへの接続で送信元IPv6アドレスを確認
-        s.connect("2001:4860:4860::8888:53").ok()?;
-        let addr = s.local_addr().ok()?;
+        if let Err(e) = s.connect("2001:4860:4860::8888:53") {
+            info!("try_get_routable_ipv6: Google IPv6 DNS に接続失敗 (IPv6未対応？): {}", e);
+            return None;
+        }
+        let addr = match s.local_addr() {
+            Ok(a) => a,
+            Err(e) => {
+                info!("try_get_routable_ipv6: local_addr 取得失敗: {}", e);
+                return None;
+            }
+        };
         if let IpAddr::V6(ip6) = addr.ip() {
             // fe80::/10 (link-local)、ループバック、未指定を除外
             if !ip6.is_loopback()
                 && !ip6.is_unspecified()
                 && (ip6.segments()[0] & 0xffc0) != 0xfe80
             {
+                info!("try_get_routable_ipv6: グローバルIPv6アドレス取得: {}", ip6);
                 return Some(IpAddr::V6(ip6));
             }
+            info!("try_get_routable_ipv6: {} はグローバルでない (loopback/link-local/unspecified)", ip6);
+        } else {
+            info!("try_get_routable_ipv6: local addr {} はIPv6でない", addr.ip());
         }
         None
     }
@@ -661,6 +680,7 @@ impl MQTTStunClient {
                     encrypted_data.len()
                 );
                 if let Some(peer_addr_str) = self.decrypt_message(&encrypted_data) {
+                    info!("復号したサーバアドレス文字列: {:?} (has_v6={})", peer_addr_str, has_v6);
                     match Self::select_best_addr(&peer_addr_str, has_v6) {
                         Some(peer_addr) => {
                             info!("ピアアドレスの復号＆パース成功！ {}", peer_addr);
