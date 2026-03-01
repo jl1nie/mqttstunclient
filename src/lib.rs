@@ -602,6 +602,10 @@ impl MQTTStunClient {
                                 data,
                                 details: _,
                             } if recv_topic == topic_to_subscribe_for_thread => {
+                                if data.is_empty() {
+                                    info!("空メッセージ受信 (get_server_addr), スキップするね！");
+                                    continue;
+                                }
                                 info!("暗号化されたデータ受信！ ({} bytes)", data.len());
                                 if let Err(e) = tx.send(data.to_vec()) {
                                     info!("チャネルに暗号化データ送るの失敗した… {}", e);
@@ -648,9 +652,9 @@ impl MQTTStunClient {
                 return None;
             }
         }
-        info!("メインスレッド: subscribe完了！ チャネルからの受信待ち…");
+        info!("メインスレッド: subscribe完了！ チャネルからの受信待ち… (60sec timeout)");
 
-        let peer_addr_option = match rx.recv_timeout(std::time::Duration::from_secs(300)) {
+        let peer_addr_option = match rx.recv_timeout(std::time::Duration::from_secs(60)) {
             Ok(encrypted_data) => {
                 info!(
                     "メインスレッドで暗号化データゲットだぜ！ ({} bytes)",
