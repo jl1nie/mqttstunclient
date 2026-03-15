@@ -508,71 +508,90 @@ impl MQTTStunClient {
             .unwrap();
 
         let topic = format!("{}{}", self.server_name, "/client");
-        client
-            .publish(topic.clone(), QoS::AtLeastOnce, true, Vec::new()) // 空メッセージで上書き！
-            .unwrap();
+        // 空メッセージで上書きしない: クライアントが publish した retain をそのまま使う
+        // （上書きすると race condition でクライアントのアドレスが消えてタイムアウトする）
         client.subscribe(topic.clone(), QoS::AtLeastOnce).unwrap();
 
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
+            if std::time::Instant::now() >= deadline {
+                info!("get_client_addr: timeout waiting for client");
+                return None;
+            }
             let notification = connection.iter().next();
-            if let Some(Ok(Event::Incoming(Packet::Publish(p)))) = notification {
-                if p.topic == topic {
-                    if let Some(peer_addr_str) = self.decrypt_message(&p.payload) {
-                        match Self::select_best_addr(&peer_addr_str, has_v6) {
-                            Some(peer_socket_addr) => {
-                                info!("Client Address: {}", peer_socket_addr);
-                                // UDPでピアにメッセージを送信 (両側が同時にパンチするよう回数・間隔を増やす)
-                                // IPv6もステートフルファイアウォール越えのためパンチが必要
-                                for _ in 0..10 {
-                                    socket.send_to(b"PU", peer_socket_addr).unwrap();
-                                    std::thread::sleep(std::time::Duration::from_millis(100));
-                                }
-                                // パンチングパケットの受信と破棄
-                                socket
-                                    .set_read_timeout(Some(std::time::Duration::from_millis(500)))
-                                    .unwrap();
-                                let mut buf = [0; 10]; // 受信バッファ
-                                for _ in 0..10 {
-                                    // 念のため複数回試行
-                                    match socket.recv_from(&mut buf) {
-                                        Ok((amt, src)) => {
-                                            if &buf[..amt] == b"PU" {
-                                                info!("Received punching packet from {}", src);
-                                            } else {
-                                                info!(
-                                                    "Received unexpected packet from {}: {:?}",
-                                                    src,
-                                                    &buf[..amt]
-                                                );
+            match notification {
+                Some(Ok(Event::Incoming(Packet::Publish(p)))) => {
+                    if p.topic == topic {
+                        if p.payload.is_empty() {
+                            info!("get_client_addr: empty payload, skipping");
+                            continue;
+                        }
+                        if let Some(peer_addr_str) = self.decrypt_message(&p.payload) {
+                            match Self::select_best_addr(&peer_addr_str, has_v6) {
+                                Some(peer_socket_addr) => {
+                                    info!("Client Address: {}", peer_socket_addr);
+                                    // UDPでピアにメッセージを送信 (両側が同時にパンチするよう回数・間隔を増やす)
+                                    // IPv6もステートフルファイアウォール越えのためパンチが必要
+                                    for _ in 0..10 {
+                                        socket.send_to(b"PU", peer_socket_addr).unwrap();
+                                        std::thread::sleep(std::time::Duration::from_millis(100));
+                                    }
+                                    // パンチングパケットの受信と破棄
+                                    socket
+                                        .set_read_timeout(Some(std::time::Duration::from_millis(
+                                            500,
+                                        )))
+                                        .unwrap();
+                                    let mut buf = [0; 10]; // 受信バッファ
+                                    for _ in 0..10 {
+                                        // 念のため複数回試行
+                                        match socket.recv_from(&mut buf) {
+                                            Ok((amt, src)) => {
+                                                if &buf[..amt] == b"PU" {
+                                                    info!("Received punching packet from {}", src);
+                                                } else {
+                                                    info!(
+                                                        "Received unexpected packet from {}: {:?}",
+                                                        src,
+                                                        &buf[..amt]
+                                                    );
+                                                }
+                                            }
+                                            Err(ref e)
+                                                if e.kind() == std::io::ErrorKind::WouldBlock
+                                                    || e.kind() == std::io::ErrorKind::TimedOut =>
+                                            {
+                                                break;
+                                            }
+                                            Err(e) => {
+                                                info!("Error receiving punching packet: {:?}", e);
+                                                break;
                                             }
                                         }
-                                        Err(ref e)
-                                            if e.kind() == std::io::ErrorKind::WouldBlock
-                                                || e.kind() == std::io::ErrorKind::TimedOut =>
-                                        {
-                                            break;
-                                        }
-                                        Err(e) => {
-                                            info!("Error receiving punching packet: {:?}", e);
-                                            break;
-                                        }
                                     }
+                                    return Some(ConnectionResult {
+                                        peer_addr: peer_socket_addr,
+                                    });
                                 }
-                                return Some(ConnectionResult {
-                                    peer_addr: peer_socket_addr,
-                                });
-                            }
-                            None => {
-                                info!("Failed to find usable address in payload");
-                                return None;
+                                None => {
+                                    info!("Failed to find usable address in payload");
+                                    return None;
+                                }
                             }
                         }
+                    } else {
+                        info!("Invalid topic: {} != {}", p.topic, topic);
                     }
-                } else {
-                    info!("Invalid topic: {} != {}", p.topic, topic);
                 }
-            } else {
-                info!("Other: {:?}", notification);
+                Some(Ok(Event::Incoming(Packet::Disconnect))) | None => {
+                    info!("get_client_addr: MQTT disconnected, giving up");
+                    return None;
+                }
+                Some(Err(e)) => {
+                    info!("get_client_addr: MQTT error: {:?}, giving up", e);
+                    return None;
+                }
+                _ => {}
             }
         }
     }
@@ -871,18 +890,8 @@ impl MQTTStunClient {
             }
         }
 
-        match client.publish(&client_topic_to_subscribe_base, QoS::AtLeastOnce, true, &[]) {
-            Ok(_) => info!(
-                "Published empty message to {} (get_client_addr)",
-                client_topic_to_subscribe_base
-            ),
-            Err(e) => {
-                info!(
-                    "Failed to publish empty message to client topic: {:?} (get_client_addr)",
-                    e
-                );
-            }
-        }
+        // /client への空publish は削除: クライアントの retain を消さないようにする
+        // （消すと race condition でクライアントのアドレスが届かずタイムアウトする）
         info!("メインスレッド: publish完了！ subscribe開始！ (get_client_addr)");
 
         match client.subscribe(&client_topic_to_subscribe_base, QoS::AtLeastOnce) {
